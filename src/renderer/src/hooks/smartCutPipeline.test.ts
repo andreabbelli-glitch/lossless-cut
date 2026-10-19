@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve, dirname, basename } from 'node:path';
 import { afterAll, beforeAll, expect, test, vi } from 'vitest';
 import type { FFprobeProbeResult } from '../../../common/ffprobe';
+import type { CompatibleCut } from '../../../common/compatibleCuts';
 
 vi.mock('react', () => ({ useCallback: (callback: unknown) => callback }));
 vi.mock('electron', () => ({ app: { isPackaged: false }, clipboard: {}, nativeImage: {} }));
@@ -80,6 +81,8 @@ let directory: string;
 let source: string;
 let offset: string;
 let videoOffset: string;
+const compressionMarker = JSON.stringify({ version: 1, id: '00000000-0000-4000-8000-000000000019', profile: 'hevc-main10-crf26-slow-v1', generation: 1 });
+const compressionComment = 'STASH-COMPRESSION:v1:00000000-0000-4000-8000-000000000019:hevc-main10-crf26-slow-v1';
 
 type Metadata = FFprobeProbeResult & Required<Pick<FFprobeProbeResult, 'format' | 'streams'>>;
 
@@ -90,14 +93,15 @@ async function metadata(path: string): Promise<Metadata> {
   return { ...value, streams: value.streams, format: value.format };
 }
 
-async function cut(path: string, name: string, start: number, end: number, allowWholeSegmentEncode = false, options: { signal?: AbortSignal, onVerification?: (id: string | undefined) => void, overwrite?: boolean, verifySkipped?: boolean, ordinary?: boolean, videoOnly?: boolean, fromFrames?: number, toFrames?: number } = {}) {
+async function cut(path: string, name: string, start: number, end: number, allowWholeSegmentEncode = false, options: { signal?: AbortSignal, onVerification?: (id: string | undefined) => void, overwrite?: boolean, verifySkipped?: boolean, ordinary?: boolean, videoOnly?: boolean, fromFrames?: number, toFrames?: number, deferAudioContentToMerge?: boolean, compatibleTimings?: CompatibleCut[], additionalSegments?: { start: number, end: number, name: string }[], stripMetadata?: boolean } = {}) {
   const meta = await metadata(path);
   const commands: string[][] = [];
   // React's identity adapter executes the actual export operation below.
   // eslint-disable-next-line react-hooks/rules-of-hooks
   const operations = useFfmpegOperations({ filePath: path, isEncoding: !options.ordinary, lossyMode: undefined, enableOverwriteOutput: options.overwrite ?? true, outputPlaybackRate: 1, cutFromAdjustmentFrames: options.fromFrames ?? 0, cutToAdjustmentFrames: options.toFrames ?? 0, appendLastCommandsLog: vi.fn(), appendFfmpegCommandLog: (args) => commands.push(args), encCustomBitrate: undefined, ffmpegHwaccel: 'none', treatInputFileModifiedTimeAsStart: false, treatOutputFileModifiedTimeAsStart: false, allowWholeSegmentEncode });
-  const result = await operations.cutMultiple({ ...options, outputDir: directory, customOutDir: directory, segments: [{ start, end, originalIndex: 0 }], cutFileNames: [name], fileDuration: Number(meta.format.duration), rotation: undefined, detectedFps: 25, onProgress: vi.fn(), keyframeCut: true, copyFileStreams: [{ path, streamIds: meta.streams.filter((stream) => !options.videoOnly || stream.codec_type === 'video').map((stream) => stream.index) }], allFilesMeta: { [path]: { ...meta, chapters: meta.chapters ?? [] } }, outFormat: 'mp4', shortestFlag: false, ffmpegExperimental: false, preserveMetadata: 'default', preserveMetadataOnMerge: true, preserveMovData: true, preserveChapters: false, movFastStart: false, avoidNegativeTs: undefined, paramsByFile: new Map(), chapters: undefined });
-  return { result, commands, output: join(directory, name) };
+  const segments = [{ start, end }, ...options.additionalSegments ?? []].map((segment, originalIndex) => ({ ...segment, originalIndex }));
+  const result = await operations.cutMultiple({ ...options, outputDir: directory, customOutDir: directory, segments, cutFileNames: [name, ...(options.additionalSegments ?? []).map((segment) => segment.name)], fileDuration: Number(meta.format.duration), rotation: undefined, detectedFps: 25, onProgress: vi.fn(), keyframeCut: true, copyFileStreams: [{ path, streamIds: meta.streams.filter((stream) => !options.videoOnly || stream.codec_type === 'video').map((stream) => stream.index) }], allFilesMeta: { [path]: { ...meta, chapters: meta.chapters ?? [] } }, outFormat: 'mp4', shortestFlag: false, ffmpegExperimental: false, preserveMetadata: options.stripMetadata ? 'none' : 'default', preserveMetadataOnMerge: true, preserveMovData: true, preserveChapters: false, movFastStart: false, avoidNegativeTs: undefined, paramsByFile: new Map(), chapters: undefined });
+  return { result, commands, operations, output: join(directory, name) };
 }
 
 beforeAll(async () => {
@@ -106,7 +110,7 @@ beforeAll(async () => {
   offset = join(directory, 'offset.mp4');
   videoOffset = join(directory, 'video-offset.mp4');
   ffmpeg.setCustomFfPath(resolve('ffmpeg', `${process.platform}-${process.arch}`, ...(process.platform === 'win32' || process.platform === 'linux' ? ['lib'] : [])));
-  await ffmpeg.runFfmpeg(['-v', 'error', '-f', 'lavfi', '-i', 'testsrc2=s=192x108:r=25:d=24', '-f', 'lavfi', '-i', 'sine=r=48000:d=24', '-c:v', 'libx265', '-pix_fmt', 'yuv420p10le', '-crf', '26', '-preset', 'slow', '-x265-params', 'open-gop=0:pools=1:frame-threads=1:keyint=50:min-keyint=50:scenecut=0:log-level=error', '-tag:v', 'hvc1', '-c:a', 'aac', '-y', source]);
+  await ffmpeg.runFfmpeg(['-v', 'error', '-f', 'lavfi', '-i', 'testsrc2=s=192x108:r=25:d=24', '-f', 'lavfi', '-i', 'sine=r=48000:d=24', '-c:v', 'libx265', '-pix_fmt', 'yuv420p10le', '-crf', '26', '-preset', 'slow', '-x265-params', 'open-gop=0:pools=1:frame-threads=1:keyint=50:min-keyint=50:scenecut=0:log-level=error', '-tag:v', 'hvc1', '-c:a', 'aac', '-metadata', `stash_compression=${compressionMarker}`, '-metadata', `comment=${compressionComment}`, '-movflags', '+use_metadata_tags', '-y', source]);
   await ffmpeg.runFfmpeg(['-v', 'error', '-copyts', '-i', source, '-itsoffset', '0.018', '-i', source, '-map', '0:v', '-map', '1:a', '-c', 'copy', '-movie_timescale', '192000', '-y', offset]);
   await ffmpeg.runFfmpeg(['-v', 'error', '-copyts', '-itsoffset', '0.018', '-i', source, '-i', source, '-map', '0:v', '-map', '1:a', '-c', 'copy', '-movie_timescale', '192000', '-y', videoOffset]);
 }, 30000);
@@ -117,13 +121,14 @@ afterAll(async () => {
 });
 
 test('Main10 smart cut encodes both borders and retains exactly 100 video frames', async () => {
-  const { result, output, commands } = await cut(source, 'cut.mp4', 1, 5);
+  const { result, output, commands } = await cut(source, 'cut.mp4', 1, 5, false, { stripMetadata: true });
   expect(result[0]?.validated).toBe(true);
   const { stdout } = await ffmpeg.runFfprobe(['-v', 'error', '-count_frames', '-show_entries', 'stream=codec_type,codec_name,pix_fmt,profile,nb_read_frames,duration', '-of', 'json', output]);
   const { streams } = JSON.parse(new TextDecoder().decode(stdout));
   expect(streams[0]).toMatchObject({ codec_name: 'hevc', pix_fmt: 'yuv420p10le', profile: 'Main 10', nb_read_frames: '100', duration: '4.000000' });
   expect(commands.filter((args) => args.includes('libx265'))).toHaveLength(2);
   expect(commands.filter((args) => args.includes('libx265')).every((args) => !args.includes('-map') || !args.includes('0:1'))).toBe(true);
+  expect((await metadata(output)).format.tags).toMatchObject({ stash_compression: compressionMarker, comment: compressionComment });
 }, 30000);
 
 test('an inherited audio offset remains under one common source shift', async () => {
@@ -217,4 +222,44 @@ test('ordinary stream-copy verification uses the effective frame-adjusted source
   expect(commands.some((args) => args.includes('libx265'))).toBe(false);
   const { stdout } = await ffmpeg.runFfprobe(['-v', 'error', '-select_streams', 'v:0', '-count_frames', '-show_entries', 'stream=nb_read_frames', '-of', 'json', output]);
   expect(JSON.parse(new TextDecoder().decode(stdout)).streams[0].nb_read_frames).toBe('50');
+}, 30000);
+
+test('actual cutMultiple intermediates defer AAC content until the contiguous final merge restores decoder context', async () => {
+  const { planCompatibleCuts } = await import('../../../main/compatibleCuts');
+  const { releaseOutputTransaction } = await import('../../../main/outputTransaction');
+  // This positive needs unambiguous packet anchors; repetitive sine AAC is
+  // covered separately by the verifier's conservative ambiguity regressions.
+  const mergeSource = join(directory, 'merge-source.mp4');
+  await ffmpeg.runFfmpeg(['-v', 'error', '-i', source, '-f', 'lavfi', '-i', 'anoisesrc=color=pink:sample_rate=48000:duration=24:amplitude=0.2:seed=42', '-map', '0:v:0', '-map', '1:a:0', '-c:v', 'copy', '-c:a', 'aac', '-metadata', `stash_compression=${compressionMarker}`, '-metadata', `comment=${compressionComment}`, '-movflags', '+use_metadata_tags', '-y', mergeSource]);
+  const plan = await planCompatibleCuts({ path: mergeSource, streamIds: [0, 1], segments: [{ start: 0, end: 8 }, { start: 8, end: 16 }] });
+  if (!plan.possible) throw new Error(plan.issues.join('; '));
+  const { result, operations } = await cut(mergeSource, 'merge-first.mp4', 0, 8, false, { ordinary: true, deferAudioContentToMerge: true, compatibleTimings: plan.segments, additionalSegments: [{ start: 8, end: 16, name: 'merge-second.mp4' }] });
+  try {
+    expect(result).toHaveLength(2);
+    expect(result.every((part) => part.created && !part.validated && part.pendingMerge && part.transactionId != null)).toBe(true);
+    const mergedPath = join(directory, 'actual-merged.mp4');
+    const merged = await operations.concatCutSegments({ customOutDir: directory, outFormat: 'mp4', segmentPaths: result.map((part) => part.path), segmentSources: result.map((part) => ({ path: part.path, origins: part.originalSources })), segmentDurations: plan.segments.map((segment) => segment.duration), ffmpegExperimental: false, onProgress: vi.fn(), preserveMovData: true, movFastStart: false, chapterNames: undefined, preserveMetadataOnMerge: true, mergedOutFilePath: mergedPath });
+    expect(merged).toMatchObject({ status: 'created', validated: true });
+    expect((await metadata(mergedPath)).format.tags).toMatchObject({ stash_compression: compressionMarker, comment: compressionComment });
+    const pcm = async (path: string, to?: number) => (await ffmpeg.runFfmpeg(['-v', 'error', '-i', path, ...(to != null ? ['-t', String(to)] : []), '-map', '0:a:0', '-c:a', 'pcm_s16le', '-f', 's16le', '-'])).stdout;
+    expect(Buffer.from(await pcm(mergedPath))).toEqual(Buffer.from(await pcm(mergeSource, 16)));
+  } finally {
+    await Promise.all(result.flatMap((part) => (part.transactionId != null ? [releaseOutputTransaction(part.transactionId)] : [])));
+  }
+}, 40000);
+
+test('a later cut failure releases earlier pending reservations without replacing their existing destination', async () => {
+  const { planCompatibleCuts } = await import('../../../main/compatibleCuts');
+  const { beginOutputTransaction, releaseOutputTransaction } = await import('../../../main/outputTransaction');
+  const plan = await planCompatibleCuts({ path: source, streamIds: [0, 1], segments: [{ start: 0, end: 8 }] });
+  if (!plan.possible) throw new Error(plan.issues.join('; '));
+  const target = join(directory, 'held-before-error.mp4');
+  await writeFile(target, 'previous result');
+  let verificationCount = 0;
+  await expect(cut(source, 'held-before-error.mp4', 0, 8, false, { ordinary: true, deferAudioContentToMerge: true, compatibleTimings: plan.segments, additionalSegments: [{ start: 8, end: 12, name: 'bad-later.mp4' }], onVerification: (id) => { if (id != null) verificationCount += 1; } })).rejects.toMatchObject({ name: 'ExportVerificationError' });
+  expect(verificationCount).toBe(2);
+  expect(await readFile(target, 'utf8')).toBe('previous result');
+  const next = await beginOutputTransaction(target, true);
+  expect(next.status).toBe('created');
+  if (next.status === 'created') await releaseOutputTransaction(next.id);
 }, 30000);

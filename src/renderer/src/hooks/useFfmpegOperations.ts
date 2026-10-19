@@ -652,8 +652,9 @@ function useFfmpegOperations({ filePath, treatInputFileModifiedTimeAsStart, trea
   }, [appendFfmpegCommandLog, filePath, lossyMode]);
 
   const cutMultiple = useCallback(async ({
-    outputDir, segments: segmentsIn, cutFileNames, fileDuration, rotation, detectedFps, onProgress: onTotalProgress, keyframeCut, copyFileStreams, allFilesMeta, outFormat, shortestFlag, ffmpegExperimental, preserveMetadata, preserveMetadataOnMerge, preserveMovData, preserveChapters, movFastStart, avoidNegativeTs, paramsByFile, chapters, onVerification, compatibleTimings, signal, verifySkipped = false,
+    outputDir, segments: segmentsIn, cutFileNames, fileDuration, rotation, detectedFps, onProgress: onTotalProgress, keyframeCut, copyFileStreams, allFilesMeta, outFormat, shortestFlag, ffmpegExperimental, preserveMetadata, preserveMetadataOnMerge, preserveMovData, preserveChapters, movFastStart, avoidNegativeTs, paramsByFile, chapters, onVerification, compatibleTimings, signal, verifySkipped = false, deferAudioContentToMerge = false,
   }: {
+    deferAudioContentToMerge?: boolean | undefined,
     verifySkipped?: boolean | undefined,
     signal?: AbortSignal | undefined,
     onVerification?: VerificationPhase | undefined,
@@ -926,6 +927,7 @@ function useFfmpegOperations({ filePath, treatInputFileModifiedTimeAsStart, trea
       return muxOriginalTracks(assembled, firstVideoTime, videoParts.length > 1);
     };
 
+    const heldTransactions: string[] = [];
     const cutSegment = async (segment: { start: number, end: number }, index: number) => {
       signal?.throwIfAborted();
       const path = join(outputDir, cutFileNames[index]!);
@@ -938,7 +940,7 @@ function useFfmpegOperations({ filePath, treatInputFileModifiedTimeAsStart, trea
       const selectedStreams = copyFileStreams.flatMap((source) => source.streamIds.map((streamId) => allFilesMeta[source.path]!.streams.find((stream) => stream.index === streamId)!));
       const { cuttingStart, cuttingEnd } = getLosslessCutRange({ cutFrom: segment.start, cutTo: segment.end, fileDuration, frameDuration: getFrameDuration(detectedFps), cutFromAdjustmentFrames, cutToAdjustmentFrames });
       const conversionVerification = getStreamConversionVerification(getMapStreamsArgs({ copyFileStreams, allFilesMeta, outFormat, needFlac: (!isEncoding || compatibleTimings?.[index] != null) && (cuttingStart || cuttingEnd) }), selectedStreams);
-      const verificationOptions = { ...conversionVerification, timeScale: outputPlaybackRate, preserveTrackMetadata: preserveMetadata !== 'none' && paramsByFile.size === 0 };
+      const verificationOptions = { ...conversionVerification, timeScale: outputPlaybackRate, preserveTrackMetadata: preserveMetadata !== 'none' && paramsByFile.size === 0, deferAudioContentToMerge };
       const outcome = await writeValidatedOutput({
         path,
         overwrite: enableOverwriteOutput,
@@ -950,12 +952,28 @@ function useFfmpegOperations({ filePath, treatInputFileModifiedTimeAsStart, trea
         sources: originalSources,
         write: (candidate) => cutSegmentFile(segment, index, candidate, cleanupPaths, compatibleTimings?.[index]),
       });
+      if (outcome.status === 'pending-merge') heldTransactions.push(outcome.transactionId);
       if (outcome.status === 'created') await tryDeleteFiles(cleanupPaths);
-      if (outcome.status === 'skipped' && verifySkipped) await validateOutput({ path, sources: originalSources, merged: false, reencodedVideo: isEncoding && compatibleTimings?.[index] == null, signal, onVerification, verificationOptions });
-      return { path, created: outcome.status === 'created', validated: outcome.status === 'created' || verifySkipped, originalSources };
+      const skippedVerification = outcome.status === 'skipped' && verifySkipped
+        ? await validateOutput({ path, sources: originalSources, merged: false, reencodedVideo: isEncoding && compatibleTimings?.[index] == null, signal, onVerification, verificationOptions })
+        : undefined;
+      const pendingMerge = outcome.status === 'pending-merge' || skippedVerification?.status === 'pending-merge';
+      return {
+        path: outcome.path,
+        finalPath: path,
+        created: outcome.status !== 'skipped',
+        validated: outcome.status === 'created' || skippedVerification?.status === 'passed',
+        pendingMerge,
+        transactionId: outcome.status === 'pending-merge' ? outcome.transactionId : undefined,
+        cleanupPaths: pendingMerge ? cleanupPaths : [],
+        originalSources,
+      };
     };
     try {
       return await pMap(segments, cutSegment, { concurrency: 1 });
+    } catch (error) {
+      await Promise.allSettled(heldTransactions.map((id) => mainApi.releaseOutputTransaction(id)));
+      throw error;
     } finally {
       if (chaptersPath) await tryDeleteFiles([chaptersPath]);
     }

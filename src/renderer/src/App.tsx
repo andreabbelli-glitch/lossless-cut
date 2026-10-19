@@ -1146,6 +1146,7 @@ function App() {
     const owner = crypto.randomUUID();
     const exportProgress = (value: number) => { if (workingStateRef.current?.owner === owner) setProgress(value); };
     const exportAbortController = new AbortController();
+    const heldIntermediateTransactions: string[] = [];
     try {
       setWorking({ text: i18n.t('Exporting'), owner, abortController: exportAbortController });
       if (acceptedPlan?.possible && 'sourceIdentity' in acceptedPlan && !await mainApi.checkCompatibleSource({ path: filePath, sourceIdentity: acceptedPlan.sourceIdentity! })) {
@@ -1203,6 +1204,7 @@ function App() {
         segments: exportSegments,
         compatibleTimings: acceptedPlan?.possible ? acceptedPlan.segments : undefined,
         verifySkipped: willMerge,
+        deferAudioContentToMerge: willMerge && autoDeleteMergedSegments,
         signal: exportAbortController.signal,
         cutFileNames,
         onProgress: exportProgress,
@@ -1219,6 +1221,7 @@ function App() {
         detectedFps,
         onVerification: verificationPhase(owner, i18n.t('Exporting'), exportAbortController),
       });
+      heldIntermediateTransactions.push(...outFiles.flatMap((file) => (file.transactionId != null ? [file.transactionId] : [])));
 
       let mergedOutFilePath: string | undefined;
       let mergeCreated = false;
@@ -1243,6 +1246,8 @@ function App() {
         const [fileName] = fileNames;
         invariant(fileName != null);
         mergedOutFilePath = getOutPath({ customOutDir, filePath, fileName });
+        const mergedConflict = await mainApi.checkOutputPathIdentity({ inputPaths: Object.keys(allFilesMeta), outputPaths: [...cutFileNames.map((name) => pathJoin(outputDir, name)), mergedOutFilePath], refresh: true });
+        if (mergedConflict) { setExportConfirmOpen(true); throw new UserFacingError(`${i18n.t('Invalid output file name')}: ${mergedConflict.path}`); }
 
         const merged = await concatCutSegments({
           customOutDir,
@@ -1264,7 +1269,7 @@ function App() {
         if (!mergeCreated) mergedOutFilePath = undefined;
 
         // don't delete existing files that were not created by losslesscut now (due to overwrite disabled) https://github.com/mifi/lossless-cut/issues/2436
-        const createdOutFiles = outFiles.flatMap((f) => (f.created ? [f.path] : []));
+        const createdOutFiles = outFiles.flatMap((f) => (f.created ? [f.path, ...f.cleanupPaths] : []));
         if (mergeCreated && autoDeleteMergedSegments) await tryDeleteFiles(createdOutFiles);
       }
 
@@ -1384,6 +1389,7 @@ function App() {
 
       handleExportFailed(err);
     } finally {
+      await Promise.allSettled(heldIntermediateTransactions.map((id) => mainApi.releaseOutputTransaction(id)));
       exportInProgressRef.current = false;
       if (workingStateRef.current?.owner === owner) {
         setWorking(undefined);

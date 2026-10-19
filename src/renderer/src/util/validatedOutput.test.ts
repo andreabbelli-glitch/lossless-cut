@@ -11,7 +11,8 @@ vi.mock('../mainApi', async () => ({ default: {
   cancelExportVerification: cancelVerify,
 } }));
 
-const { writeValidatedOutput } = await import('./validatedOutput');
+const { writeValidatedOutput, validateOutput } = await import('./validatedOutput');
+const { beginOutputTransaction, releaseOutputTransaction } = await import('../../../main/outputTransaction');
 
 async function cleanup(dir: string) {
   if (dirname(resolve(dir)) !== resolve(tmpdir()) || !basename(dir).startsWith('losslesscut-validated-')) throw new Error('Unexpected test directory');
@@ -177,5 +178,70 @@ test('fresh preflight protects original paths referenced through intermediate or
     expect(write).not.toHaveBeenCalled();
     expect(verify).not.toHaveBeenCalled();
     expect(await readFile(source, 'utf8')).toBe('source');
+  });
+});
+
+test('a merge-only intermediate keeps its existing destination and reservation until the final caller releases it', async () => {
+  await fixture(async (target, source, dir) => {
+    verify.mockResolvedValue({ status: 'pending-merge', issues: [] });
+    const outcome = await writeValidatedOutput({ path: target, overwrite: true, sources: [{ path: source }], merged: false, verificationOptions: { deferAudioContentToMerge: true }, write: async (candidate) => { await writeFile(candidate, 'merge candidate'); return 'writer result'; } });
+    expect(outcome).toMatchObject({ status: 'pending-merge', finalPath: target, value: 'writer result' });
+    if (outcome.status !== 'pending-merge') throw new Error('Expected a held intermediate');
+    try {
+      expect(outcome.path).not.toBe(target);
+      expect(await readFile(outcome.path, 'utf8')).toBe('merge candidate');
+      expect(await readFile(target, 'utf8')).toBe('previous');
+      expect((await readdir(dir)).some((name) => name.includes('.previous.'))).toBe(false);
+      await expect(beginOutputTransaction(target, true)).rejects.toThrow('still being written or verified');
+      expect(verify).toHaveBeenCalledWith(expect.objectContaining({ path: outcome.path, deferAudioContentToMerge: true, merged: false }));
+    } finally {
+      await releaseOutputTransaction(outcome.transactionId);
+    }
+    const next = await beginOutputTransaction(target, true);
+    expect(next.status).toBe('created');
+    if (next.status === 'created') await releaseOutputTransaction(next.id);
+    expect(await readFile(target, 'utf8')).toBe('previous');
+  });
+});
+
+test('a fresh merge intermediate uses the requested path while remaining uncertified for standalone adoption', async () => {
+  await fixture(async (_target, source, dir) => {
+    const target = join(dir, 'fresh.mp4');
+    verify.mockResolvedValue({ status: 'pending-merge', issues: [] });
+    const outcome = await writeValidatedOutput({ path: target, overwrite: true, sources: [{ path: source }], merged: false, verificationOptions: { deferAudioContentToMerge: true }, write: async (candidate) => writeFile(candidate, 'new intermediate') });
+    expect(outcome).toMatchObject({ status: 'pending-merge', path: target, finalPath: target });
+    if (outcome.status === 'pending-merge') await releaseOutputTransaction(outcome.transactionId);
+    expect(await readFile(target, 'utf8')).toBe('new intermediate');
+  });
+});
+
+test('a pending result without the merge-intermediate flag is rejected and its reservation released', async () => {
+  await fixture(async (target, source) => {
+    verify.mockResolvedValue({ status: 'pending-merge', issues: [] });
+    await expect(writeValidatedOutput({ path: target, overwrite: true, sources: [{ path: source }], merged: false, write: async (candidate) => writeFile(candidate, 'candidate') })).rejects.toMatchObject({ name: 'ExportVerificationError' });
+    expect(await readFile(target, 'utf8')).toBe('previous');
+    const next = await beginOutputTransaction(target, true);
+    if (next.status === 'created') await releaseOutputTransaction(next.id);
+    expect(next.status).toBe('created');
+  });
+});
+
+test('a final merge never permits deferred audio-content verification', async () => {
+  await fixture(async (target, source) => {
+    verify.mockResolvedValue({ status: 'pending-merge', issues: [] });
+    await expect(validateOutput({ path: target, sources: [{ path: source }], merged: true, verificationOptions: { deferAudioContentToMerge: true } })).rejects.toThrow('cannot be deferred for a final merge');
+    expect(verify).not.toHaveBeenCalled();
+  });
+});
+
+test('abort during a pending intermediate verification still releases the reservation and preserves the old result', async () => {
+  await fixture(async (target, source) => {
+    const controller = new AbortController();
+    verify.mockImplementation(async () => { controller.abort(); return { status: 'pending-merge', issues: [] }; });
+    await expect(writeValidatedOutput({ path: target, overwrite: true, sources: [{ path: source }], merged: false, verificationOptions: { deferAudioContentToMerge: true }, signal: controller.signal, write: async (candidate) => writeFile(candidate, 'candidate') })).rejects.toMatchObject({ name: 'AbortError' });
+    expect(await readFile(target, 'utf8')).toBe('previous');
+    const next = await beginOutputTransaction(target, true);
+    if (next.status === 'created') await releaseOutputTransaction(next.id);
+    expect(next.status).toBe('created');
   });
 });
