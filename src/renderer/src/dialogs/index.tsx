@@ -7,7 +7,9 @@ import ky from 'ky';
 import pMap from 'p-map';
 
 import { formatDuration } from '../util/duration';
-import { parseRatio } from '../../../common/util';
+import { parseFiniteNumber, parseOutputPlaybackRate } from '../util/input';
+import { getDurationSegmentCount } from '../segments';
+import { maxSegmentsAllowed } from '../util/constants';
 import { parseYouTube } from '../edlFormats';
 import { appPath, isMasBuild, isStoreBuild, isWindows, isWindowsStoreBuild, testFailFsOperation, trashFile, unlinkWithRetry } from '../util';
 import type { ParseTimecode } from '../types';
@@ -187,15 +189,15 @@ async function askForNumSegments() {
     inputValue: '2',
     text: i18n.t('Divide timeline into a number of equal length segments'),
     inputValidator: (v) => {
-      const parsed = parseInt(v, 10);
-      if (!Number.isNaN(parsed) && parsed >= 2 && parsed <= maxSegments) return null;
+      const parsed = parseFiniteNumber(v, true);
+      if (parsed != null && parsed >= 2 && parsed <= maxSegments) return null;
       return i18n.t('Please input a valid number of segments');
     },
   });
 
   if (value == null) return undefined;
 
-  return parseInt(value, 10);
+  return parseFiniteNumber(value, true);
 }
 
 export async function createNumSegments(totalDuration: number) {
@@ -351,7 +353,14 @@ export async function createFixedByteSixedSegments({ fileDuration, fileSize }: {
     text: i18n.t('Divide timeline into a number of segments with an approximate byte size'),
     inputValidator: (v) => {
       const bytes = parseBytesHuman(v);
-      if (bytes != null) return undefined;
+      if (bytes != null && Number.isFinite(bytes) && bytes > 0 && Number.isFinite(fileSize) && fileSize > 0) {
+        try {
+          getDurationSegmentCount(fileDuration * (bytes / fileSize), fileDuration);
+          return undefined;
+        } catch {
+          return i18n.t('Tried to create too many segments (max {{maxSegmentsAllowed}}.)', { maxSegmentsAllowed });
+        }
+      }
       return i18n.t('Please input a valid size. Example: {{example}}', { example });
     },
   });
@@ -359,9 +368,11 @@ export async function createFixedByteSixedSegments({ fileDuration, fileSize }: {
   if (value == null) return undefined;
 
   const parsed = parseBytesHuman(value);
-  invariant(parsed != null);
+  invariant(parsed != null && Number.isFinite(parsed) && parsed > 0);
 
-  return fileDuration * (parsed / fileSize);
+  const duration = fileDuration * (parsed / fileSize);
+  getDurationSegmentCount(duration, fileDuration); // validate the shared limit before returning to the caller
+  return duration;
 }
 
 
@@ -499,18 +510,10 @@ export const OutputIncorrectSeeHelpMenu = () => (
 );
 
 export async function askForPlaybackRate({ detectedFps, outputPlaybackRate }: { detectedFps: number | undefined, outputPlaybackRate: number }) {
-  const fps = detectedFps || 1;
+  const fps = detectedFps != null && Number.isFinite(detectedFps) && detectedFps > 0 ? detectedFps : 1;
   const currentFps = fps * outputPlaybackRate;
 
-  function parseValue(v: string) {
-    if (v.trim() === '') return 1; // default to 1 if empty
-
-    const newFps = v.includes('/') ? parseRatio(v) : parseFloat(v); // allow e.g. 30000/1001
-    if (newFps != null && !Number.isNaN(newFps)) {
-      return newFps / fps;
-    }
-    return undefined;
-  }
+  const parseValue = (value: string) => parseOutputPlaybackRate(value, detectedFps);
 
   const { value, isConfirmed } = await getSwal().Swal.fire<string>({
     title: i18n.t('Change FPS'),

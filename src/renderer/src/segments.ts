@@ -5,6 +5,7 @@ import maxBy from 'lodash/maxBy';
 import invariant from 'tiny-invariant';
 
 import type { DefiniteSegmentBase, PlaybackMode, SegmentBase, SegmentTags, SegmentToExport, StateSegment } from './types';
+import { maxSegmentsAllowed } from './util/constants';
 
 
 export const isDurationValid = (duration?: number): duration is number => duration != null && Number.isFinite(duration) && duration > 0;
@@ -149,10 +150,12 @@ export function combineOverlappingSegments<T extends SegmentBase>(existingSegmen
 }
 
 export function hasAnySegmentOverlap(sortedSegments: { start: number, end: number }[]) {
-  if (sortedSegments.length === 0) return false;
-
-  const overlappingGroups = partitionIntoOverlappingRanges(sortedSegments);
-  return overlappingGroups.length > 0;
+  let maxEnd = -Infinity;
+  for (const segment of sortedSegments) {
+    if (segment.start < maxEnd) return true;
+    maxEnd = Math.max(maxEnd, segment.end);
+  }
+  return false;
 }
 
 // eslint-disable-next-line space-before-function-paren
@@ -162,11 +165,9 @@ export function invertSegments(
   includeLastSegment: boolean,
   duration?: number,
 ) {
-  const sortedSegments = sortedSegmentsIn.map((seg) => ({ ...seg, end: seg.end ?? seg.start }));
+  const sortedSegments = combineOverlappingSegments(sortedSegmentsIn.map((seg) => ({ ...seg, end: seg.end ?? seg.start })));
 
   if (sortedSegments.length === 0) return [];
-
-  if (hasAnySegmentOverlap(sortedSegments)) return [];
 
   const ret: { start: number, end?: number | undefined, segId?: string | undefined, name?: string | undefined }[] = [];
 
@@ -283,13 +284,29 @@ export const filterNonMarkers = <T extends { end?: number | undefined }>(segment
   end,
 }] : []));
 
+export function getDurationSegmentCount(segmentDuration: number, totalDuration: number) {
+  if (!isDurationValid(segmentDuration) || !isDurationValid(totalDuration)) throw new RangeError('Segment duration must be finite and greater than zero');
+  const quotient = totalDuration / segmentDuration;
+  const nearest = Math.round(quotient);
+  // Only absorb arithmetic rounding at the precision of this calculation, not real short tails.
+  const count = nearest >= 1 && Math.abs(quotient - nearest) <= Number.EPSILON * Math.max(1, quotient) * 4 ? nearest : Math.max(1, Math.ceil(quotient));
+  if (!Number.isFinite(count) || count > maxSegmentsAllowed) throw new RangeError(`Tried to create too many segments (max ${maxSegmentsAllowed}.)`);
+  return count;
+}
+
 export function makeDurationSegments(segmentDuration: number, totalDuration: number) {
+  const count = getDurationSegmentCount(segmentDuration, totalDuration);
   const edl: { start: number, end: number }[] = [];
-  for (let start = 0; start < totalDuration; start += segmentDuration) {
-    const end = start + segmentDuration;
-    edl.push({ start, end: Math.min(end, totalDuration) });
+  for (let index = 0; index < count; index += 1) {
+    edl.push({ start: index * segmentDuration, end: index === count - 1 ? totalDuration : (index + 1) * segmentDuration });
   }
   return edl;
+}
+
+export function getSelectedSegmentsForExport(segments: StateSegment[]) {
+  const all = filterNonMarkers(segments.map((segment, originalIndex) => ({ ...segment, originalIndex }))).filter((segment) => !segment.initial);
+  const selected = all.filter((segment) => segment.selected);
+  return selected.length > 0 ? selected : all;
 }
 
 export const isInitialSegment = (segments: StateSegment[]) => segments.length === 0 || (segments.length === 1 && segments[0]!.initial);

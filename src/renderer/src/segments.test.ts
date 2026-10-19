@@ -1,6 +1,47 @@
 import { test, it, expect, describe } from 'vitest';
 
-import { convertSegmentsToChaptersWithGaps, partitionIntoOverlappingRanges, formatSegNum, combineOverlappingSegments, invertSegments } from './segments';
+import { convertSegmentsToChaptersWithGaps, partitionIntoOverlappingRanges, formatSegNum, combineOverlappingSegments, invertSegments, hasAnySegmentOverlap, makeDurationSegments, getSelectedSegmentsForExport, createSegment, addSegmentColorIndex } from './segments';
+
+describe('safe duration splitting', () => {
+  it('does not manufacture a floating-point tail and retains real short tails', () => {
+    expect(makeDurationSegments(3.3, 9.9)).toEqual([
+      { start: 0, end: 3.3 },
+      { start: 3.3, end: 6.6 },
+      { start: 6.6, end: 9.9 },
+    ]);
+    const actualTail = makeDurationSegments(3.3, 9.900000001);
+    expect(actualTail).toHaveLength(4);
+    expect(actualTail.at(-1)!.end - actualTail.at(-1)!.start).toBeGreaterThan(0);
+  });
+
+  it('rejects invalid or excessive counts before allocation', () => {
+    for (const duration of [0, -1, NaN, Infinity, Number.MIN_VALUE]) expect(() => makeDurationSegments(duration, 100)).toThrow(RangeError);
+    for (const total of [0, -1, NaN, Infinity]) expect(() => makeDurationSegments(1, total)).toThrow(RangeError);
+    expect(makeDurationSegments(1, 2000)).toHaveLength(2000);
+    expect(() => makeDurationSegments(1, 2001)).toThrow(RangeError);
+    expect(makeDurationSegments(Number.MAX_VALUE, Number.MIN_VALUE)).toEqual([{ start: 0, end: Number.MIN_VALUE }]);
+  });
+});
+
+it('inverts the union of nested, overlapping and adjacent exclusions', () => {
+  expect(invertSegments([
+    { start: 10, end: 20 }, { start: 15, end: 30 }, { start: 17, end: 19 }, { start: 30, end: 40 }, { start: 60, end: 70 },
+  ], true, true, 100)).toEqual([{ start: 0, end: 10 }, { start: 40, end: 60 }, { start: 70, end: 100 }]);
+  expect(invertSegments([{ start: 0, end: 100 }], true, true, 100)).toEqual([]);
+});
+
+it('checks overlap without building groups and preserves adjacent-boundary semantics', () => {
+  expect(hasAnySegmentOverlap([])).toBe(false);
+  expect(hasAnySegmentOverlap([{ start: 0, end: 1 }, { start: 1, end: 2 }])).toBe(false);
+  expect(hasAnySegmentOverlap([{ start: 0, end: 10 }, { start: 1, end: 2 }, { start: 3, end: 4 }])).toBe(true);
+});
+
+it('keeps original segment numbers in selected and fallback exports with markers', () => {
+  const marker = addSegmentColorIndex(createSegment({ start: 0, selected: false }), 0);
+  const segment = addSegmentColorIndex(createSegment({ start: 1, end: 2, selected: false }), 1);
+  expect(getSelectedSegmentsForExport([marker, segment])[0]!.originalIndex).toBe(1);
+  expect(getSelectedSegmentsForExport([marker, { ...segment, selected: true }])[0]!.originalIndex).toBe(1);
+});
 
 it('converts segments to chapters with gaps', () => {
   expect(convertSegmentsToChaptersWithGaps([
@@ -140,14 +181,14 @@ describe('invertSegments', () => {
     expect(invertSegments([
       { start: 2, end: 3.5 },
       { start: 3, end: 4 },
-    ], true, true, 100)).toMatchSnapshot();
+    ], true, true, 100)).toEqual([{ start: 0, end: 2 }, { start: 4, end: 100 }]);
   });
 
   test('overlap 2', () => {
     expect(invertSegments([
       { start: 2, end: 5 },
       { start: 3, end: 4 },
-    ], true, true, 100)).toMatchSnapshot();
+    ], true, true, 100)).toEqual([{ start: 0, end: 2 }, { start: 5, end: 100 }]);
   });
 
   test('undefined duration', () => {

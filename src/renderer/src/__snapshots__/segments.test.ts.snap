@@ -179,10 +179,6 @@ exports[`invertSegments > normal 1`] = `
 ]
 `;
 
-exports[`invertSegments > overlap 1 1`] = `[]`;
-
-exports[`invertSegments > overlap 2 1`] = `[]`;
-
 exports[`invertSegments > undefined duration 1`] = `
 [
   {

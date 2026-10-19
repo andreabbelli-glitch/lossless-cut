@@ -8,10 +8,11 @@ import Spinner from './Spinner';
 import isDev from '../isDev';
 
 
-function BigWaveform({ waveforms, relevantTime, playing, fileDurationNonZero, zoom, seekRel, darkMode }: {
+function BigWaveform({ waveforms, relevantTime, playing, playbackRate, fileDurationNonZero, zoom, seekRel, darkMode }: {
   waveforms: WaveformSlice[],
   relevantTime: number,
   playing: boolean,
+  playbackRate: number,
   fileDurationNonZero: number,
   zoom: number,
   seekRel: (a: number) => void,
@@ -63,14 +64,14 @@ function BigWaveform({ waveforms, relevantTime, playing, fileDurationNonZero, zo
 
 
   useEffect(() => {
-    const startTime = Date.now();
+    const startTime = performance.now();
 
     if (playing) {
       let raf: number;
       // eslint-disable-next-line no-inner-declarations
       function render() {
         raf = window.requestAnimationFrame(() => {
-          setSmoothTime(relevantTime + (Date.now() - startTime) / 1000);
+          setSmoothTime(Math.min(fileDurationNonZero, Math.max(0, relevantTime + ((performance.now() - startTime) / 1000) * playbackRate)));
           render();
         });
       }
@@ -84,7 +85,7 @@ function BigWaveform({ waveforms, relevantTime, playing, fileDurationNonZero, zo
     setSmoothTime(undefined);
 
     return undefined;
-  }, [relevantTime, playing]);
+  }, [relevantTime, playing, playbackRate, fileDurationNonZero]);
 
   return (
     // eslint-disable-next-line jsx-a11y/no-static-element-interactions

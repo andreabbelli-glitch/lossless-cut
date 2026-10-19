@@ -14,6 +14,7 @@ import TextInput from '../components/TextInput';
 import { ButtonRow } from '../components/Dialog';
 import { DialogButton } from '../components/Button';
 import { dangerColor } from '../colors';
+import { parseFiniteNumber } from '../util/input';
 
 
 export default ({ detectedFps, timecodeFormat, showGenericDialog }: {
@@ -42,16 +43,16 @@ export default ({ detectedFps, timecodeFormat, showGenericDialog }: {
 
   const parseTimecode = useCallback<ParseTimecode>((val: string) => {
     if (timecodeFormat === 'frameCount') {
-      const parsed = parseInt(val, 10);
-      return frameCountToDuration(parsed);
+      const parsed = parseFiniteNumber(val, true);
+      if (parsed == null) return undefined;
+      const duration = frameCountToDuration(parsed);
+      return Number.isFinite(duration) ? duration : undefined;
     }
     if (timecodeFormat === 'seconds') {
-      return parseFloat(val);
+      return parseFiniteNumber(val);
     }
-    if (timecodeFormat === 'timecodeWithFramesFraction') {
-      return parseDuration(val, detectedFps);
-    }
-    return parseDuration(val);
+    const duration = parseDuration(val, timecodeFormat === 'timecodeWithFramesFraction' ? detectedFps : undefined);
+    return duration != null && Number.isFinite(duration) ? duration : undefined;
   }, [detectedFps, frameCountToDuration, timecodeFormat]);
 
   const promptTimecode = useCallback(async ({ initialValue, title, description, inputPlaceholder, allowRelative = false }: {
@@ -81,9 +82,9 @@ export default ({ detectedFps, timecodeFormat, showGenericDialog }: {
 
         const duration = parseTimecode(withoutPrefix);
 
-        setError(duration == null ? t('Invalid timecode format') : undefined);
+        setError(duration == null || !Number.isFinite(duration) ? t('Invalid timecode format') : undefined);
 
-        if (duration != null) {
+        if (duration != null && Number.isFinite(duration)) {
           resolve({ duration, relDirection });
           onOpenChange(false);
         }

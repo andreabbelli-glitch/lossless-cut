@@ -1,5 +1,5 @@
 import type { MutableRefObject, CSSProperties, WheelEventHandler, MouseEventHandler } from 'react';
-import { memo, useRef, useMemo, useCallback, useEffect } from 'react';
+import { memo, useRef, useMemo, useCallback, useEffect, useState } from 'react';
 import { motion, useMotionValue, useSpring } from 'motion/react';
 import debounce from 'lodash/debounce';
 import { useTranslation } from 'react-i18next';
@@ -119,6 +119,8 @@ function Timeline({
   darkMode,
   setCutTime,
   setHoveringTime,
+  beginSegmentTransaction,
+  endSegmentTransaction,
 } : {
   fileDurationNonZero: number,
   startTimeOffset: number,
@@ -154,6 +156,8 @@ function Timeline({
   darkMode: boolean,
   setCutTime: UseSegments['setCutTime'],
   setHoveringTime: (time: number | undefined) => void,
+  beginSegmentTransaction: () => void,
+  endSegmentTransaction: () => void,
 }) {
   const { t } = useTranslation();
 
@@ -163,6 +167,17 @@ function Timeline({
   const timelineScrollerSkipEventRef = useRef<boolean>(false);
   const timelineScrollerSkipEventDebounce = useRef<() => void>(undefined);
   const timelineWrapperRef = useRef<HTMLDivElement>(null);
+  const [viewportWidth, setViewportWidth] = useState(0);
+
+  useEffect(() => {
+    const scroller = timelineScrollerRef.current;
+    if (scroller == null) return undefined;
+    const observer = new ResizeObserver(([entry]) => {
+      if (entry != null) setViewportWidth(entry.contentRect.width);
+    });
+    observer.observe(scroller);
+    return () => observer.disconnect();
+  }, []);
 
   const isZoomed = zoom > 1;
 
@@ -170,7 +185,7 @@ function Timeline({
 
   // Don't show keyframes if too packed together (at current zoom)
   // See https://github.com/mifi/lossless-cut/issues/259
-  const areKeyframesTooClose = keyFramesInZoomWindow.length > zoom * 200;
+  const areKeyframesTooClose = keyFramesInZoomWindow.length > Math.floor(viewportWidth / 4);
 
   const calculateTimelinePercent = useCallback((time: number) => calculateTimelinePercent2(time, fileDurationNonZero), [fileDurationNonZero]);
   const currentTimePercent = useMemo(() => calculateTimelinePercent2(playerTime, fileDurationNonZero), [fileDurationNonZero, playerTime]);
@@ -191,9 +206,11 @@ function Timeline({
   // const zoomWindowStartTime = calcZoomWindowStartTime(duration, zoom);
 
   useEffect(() => {
-    timelineScrollerSkipEventDebounce.current = debounce(() => {
+    const reset = debounce(() => {
       timelineScrollerSkipEventRef.current = false;
     }, 1000);
+    timelineScrollerSkipEventDebounce.current = reset;
+    return () => reset.cancel();
   }, []);
 
   function suppressScrollerEvents() {
@@ -205,12 +222,12 @@ function Timeline({
 
   const spring = useSpring(scrollLeftMotion, { damping: 100, stiffness: 1000 });
 
-  useEffect(() => {
+  useEffect(() => (
     spring.on('change', (value) => {
       if (timelineScrollerSkipEventRef.current) return; // Don't animate while zooming
-      timelineScrollerRef.current!.scrollLeft = value;
-    });
-  }, [spring]);
+      if (timelineScrollerRef.current != null) timelineScrollerRef.current.scrollLeft = value;
+    })
+  ), [spring]);
 
   // Pan timeline when cursor moves out of timeline window
   useEffect(() => {
@@ -289,9 +306,12 @@ function Timeline({
   }, [currentCutSeg]);
 
   const resizingSegmentRef = useRef<{ operation: 'start' | 'end' | 'move', offset?: number } | undefined>(undefined);
+  const dragCleanupRef = useRef<(() => void) | undefined>(undefined);
+  useEffect(() => () => dragCleanupRef.current?.(), []);
 
   const onMouseDown = useCallback<MouseEventHandler<HTMLElement>>((e) => {
     if (e.nativeEvent.buttons !== 1) return; // not primary button
+    dragCleanupRef.current?.();
 
     const mouseTimelinePos = getMouseTimelinePos(e.nativeEvent);
     seekAbs(mouseTimelinePos);
@@ -312,6 +332,8 @@ function Timeline({
       }
     }
 
+    const editing = resizingSegmentRef.current != null;
+    if (editing) beginSegmentTransaction();
     mouseDownRef.current = e.target;
 
     function onMouseMove(e2: MouseEvent) {
@@ -333,10 +355,13 @@ function Timeline({
     }
 
     function onMouseUp() {
+      if (dragCleanupRef.current == null) return;
+      dragCleanupRef.current = undefined;
       mouseDownRef.current = undefined;
       resizingSegmentRef.current = undefined;
       window.removeEventListener('mouseup', onMouseUp);
       window.removeEventListener('mousemove', onMouseMove);
+      if (editing) endSegmentTransaction();
     }
 
     // https://github.com/mifi/lossless-cut/issues/1432
@@ -344,7 +369,8 @@ function Timeline({
     // https://stackoverflow.com/questions/6073505/what-is-the-difference-between-screenx-y-clientx-y-and-pagex-y
     window.addEventListener('mouseup', onMouseUp, { once: true });
     window.addEventListener('mousemove', onMouseMove);
-  }, [fileDurationNonZero, getMouseTimelinePos, seekAbs, segmentMouseModifierKey, setCutTime, zoom]);
+    dragCleanupRef.current = onMouseUp;
+  }, [beginSegmentTransaction, endSegmentTransaction, fileDurationNonZero, getMouseTimelinePos, seekAbs, segmentMouseModifierKey, setCutTime, zoom]);
 
   const onMouseMove = useCallback<MouseEventHandler<HTMLDivElement>>((e) => {
     if (!mouseDownRef.current) { // no button pressed
