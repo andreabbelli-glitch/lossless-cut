@@ -1,4 +1,9 @@
 {
+  "Verifying export": "Verifica dell'esportazione",
+  "Reviewing export boundaries": "Controllo dei confini di esportazione",
+  "Compatible boundaries accepted": "Confini compatibili accettati",
+  "Use these boundaries for export": "Usa questi confini per l'esportazione",
+  "This selection needs full video encoding. Allow it for this export.": "Questa selezione richiede la ricodifica dell'intero video. Consentila per questa esportazione.",
   "Zoom in/out timeline": "Zoom +/- timeline",
   "Mouse scroll/wheel up/down": "Scorrimento mouse/rotellina su/giù",
   "Last ffmpeg commands": "Ultimi comandi ffmpeg",

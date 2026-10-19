@@ -9,10 +9,11 @@ import Button from './Button';
 import styles from './Working.module.css';
 
 
-function Working({ text, progress, onAbortClick }: {
+function Working({ text, progress, onAbortClick, nonBlocking = false }: {
   text: string,
   progress?: number | undefined,
   onAbortClick: () => void
+  nonBlocking?: boolean | undefined,
 }) {
   const { t } = useTranslation();
 
@@ -26,6 +27,17 @@ function Working({ text, progress, onAbortClick }: {
   useInterval(() => {
     setElapsedMs(Date.now() - startedAt.getTime());
   }, 100);
+
+  if (nonBlocking) {
+    return (
+      <div role="status" style={{ position: 'absolute', bottom: 4, right: 8, fontSize: '.85em', background: 'var(--gray-3)', padding: '.3em .5em', borderRadius: 4 }}>
+        {text}
+        {progress != null && ` ${(progress * 100).toFixed(0)}%`}
+        {` · ${(elapsedMs / 1000).toFixed(1)}s `}
+        <Button onClick={onAbortClick}><Trans>Abort</Trans></Button>
+      </div>
+    );
+  }
 
   return (
     <div className={styles['wrapper']} style={{ position: 'absolute', bottom: 0, top: 0, left: 0, right: 0, display: 'flex', justifyContent: 'center', alignItems: 'center' }}>

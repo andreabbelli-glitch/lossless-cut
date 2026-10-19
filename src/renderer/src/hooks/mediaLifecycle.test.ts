@@ -184,12 +184,14 @@ test('compatibility preview cancels a trailing restart when its session is dispo
 
     readyState = 'open';
 
+    sourceBuffer = sourceBuffer;
+
     constructor() {
       super();
       setTimeout(() => this.dispatchEvent(new Event('sourceopen')), 0);
     }
 
-    addSourceBuffer = () => sourceBuffer;
+    addSourceBuffer() { return this.sourceBuffer; }
   });
   vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:preview');
   vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined);

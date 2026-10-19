@@ -33,6 +33,8 @@ import AnimatedTr from './AnimatedTr';
 import type { Frame } from '../ffmpeg';
 import type { FindNearestKeyframeTime } from '../hooks/useKeyframes';
 import { troubleshootingUrl } from '../../../common/constants';
+import type { CompatibleCut } from '../../../common/compatibleCuts';
+import Button from './Button';
 import OutDirSelector from './OutDirSelector';
 import mainApi from '../mainApi';
 
@@ -113,6 +115,13 @@ function renderGenericNotice(notice: GenericNotice) {
 const rightIconStyle: CSSProperties = { fontSize: '1.2em', verticalAlign: 'middle' };
 
 function ExportConfirm({
+  compatibleProposal,
+  compatibleBoundariesAccepted,
+  onAcceptCompatibleBoundaries,
+  onPreviewBoundaryContent,
+  wholeSegmentEncodingRequested,
+  wholeSegmentEncodingApproved,
+  onWholeSegmentEncodingApprovedChange,
   areWeCutting,
   segmentsToExport,
   willMerge,
@@ -143,11 +152,18 @@ function ExportConfirm({
   neighbouringKeyFrames,
   findNearestKeyFrameTime,
 } : {
+  compatibleProposal?: { message: string, plan: { possible: boolean, issues: string[], segments: CompatibleCut[] } } | undefined,
+  compatibleBoundariesAccepted: boolean,
+  onAcceptCompatibleBoundaries: () => void,
+  onPreviewBoundaryContent: (time: number) => void,
   areWeCutting: boolean,
   segmentsToExport: SegmentToExport[],
   willMerge: boolean,
   visible: boolean,
   onClosePress: () => void,
+  wholeSegmentEncodingRequested: boolean,
+  wholeSegmentEncodingApproved: boolean,
+  onWholeSegmentEncodingApprovedChange: (approved: boolean) => void,
   onExportConfirm: () => void,
   outFormat: string | undefined,
   renderOutFmt: (style: CSSProperties) => ReactNode,
@@ -375,6 +391,45 @@ function ExportConfirm({
     >
       <table className={styles['options']}>
         <tbody>
+          {compatibleProposal != null && (
+            <tr>
+              <td colSpan={3} style={{ color: warningColor, fontSize: '.9em' }}>
+                <div>{compatibleProposal.message}</div>
+                {compatibleProposal.plan.issues.map((issue) => <div key={issue}>{issue}</div>)}
+                {compatibleProposal.plan.segments.map((segment, index) => (
+                  <div key={`${segment.start}-${segment.end}`} style={{ marginTop: '.4em' }}>
+                    {index + 1}: {segment.requested.start.toFixed(3)}–{segment.requested.end.toFixed(3)} → {segment.start.toFixed(3)}–{segment.end.toFixed(3)} s
+                    {[
+                      { amount: segment.includedBefore, from: segment.start, to: segment.requested.start, text: t('Included') },
+                      { amount: segment.includedAfter, from: segment.requested.end, to: segment.end, text: t('Included') },
+                      { amount: segment.excludedBefore, from: segment.requested.start, to: segment.start, text: t('Excluded') },
+                      { amount: segment.excludedAfter, from: segment.end, to: segment.requested.end, text: t('Excluded') },
+                    ].filter((range) => range.amount > 0).map((range) => (
+                      <div key={`${range.text}-${range.from}`}>
+                        {range.text}: {range.from.toFixed(3)}–{range.to.toFixed(3)} s ({range.amount.toFixed(3)} s)
+                        {' '}<Button onClick={() => onPreviewBoundaryContent(range.from)}>{t('Show')}</Button>
+                      </div>
+                    ))}
+                  </div>
+                ))}
+                {compatibleProposal.plan.possible && (
+                <Button disabled={compatibleBoundariesAccepted} onClick={onAcceptCompatibleBoundaries}>
+                  {compatibleBoundariesAccepted ? t('Compatible boundaries accepted') : t('Use these boundaries for export')}
+                </Button>
+                )}
+              </td>
+            </tr>
+          )}
+          {wholeSegmentEncodingRequested && (
+            <tr>
+              <td colSpan={3}>
+                <label htmlFor="whole-segment-encoding" style={{ color: warningColor, fontSize: '.9em' }}>
+                  <input id="whole-segment-encoding" type="checkbox" checked={wholeSegmentEncodingApproved} onChange={(event) => onWholeSegmentEncodingApprovedChange(event.target.checked)} />
+                  {' '}{t('This selection needs full video encoding. Allow it for this export.')}
+                </label>
+              </td>
+            </tr>
+          )}
           {notices.generic.map((notice) => renderGenericNotice(notice))}
 
           {segmentsOrInverse.selected.length !== segmentsOrInverse.all.length && (

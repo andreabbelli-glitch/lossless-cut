@@ -29,6 +29,14 @@ export async function renderWaveformPng({ signal, ...params }: Parameters<typeof
   return withFfOperation(signal, ffmpeg, async (operationId) => ffmpeg.renderWaveformPng({ ...params, operationId }));
 }
 
+export async function planCompatibleCutsWithSignal({ signal, ...params }: Omit<Parameters<typeof mainApi.planCompatibleCuts>[0], 'operationId'> & { signal: AbortSignal }) {
+  return withFfOperation(signal, ffmpeg, async (operationId) => mainApi.planCompatibleCuts({ ...params, operationId }));
+}
+
+export async function planVideoCopyRangeWithSignal({ signal, ...params }: Omit<Parameters<typeof mainApi.planVideoCopyRange>[0], 'operationId'> & { signal: AbortSignal }) {
+  return withFfOperation(signal, ffmpeg, async (operationId) => mainApi.planVideoCopyRange({ ...params, operationId }));
+}
+
 const runFfprobe = (args: readonly string[], options?: { logCli?: boolean, signal?: AbortSignal }) => withFfOperation(options?.signal, ffmpeg, async (operationId) => ffmpeg.runFfprobe(args, { ...(options?.logCli != null && { logCli: options.logCli }), operationId }));
 
 
@@ -337,11 +345,11 @@ export async function getDefaultOutFormat({ filePath, fileMeta: { format } }: { 
   return mapInputToOutputFormat(assumedFormat);
 }
 
-export async function readFileFfprobeMeta(filePath: string) {
+export async function readFileFfprobeMeta(filePath: string, signal?: AbortSignal) {
   try {
     const { stdout } = await runFfprobe([
       '-of', 'json', '-show_chapters', '-show_format', '-show_entries', 'stream', '-i', filePath, '-hide_banner',
-    ]);
+    ], { ...(signal != null ? { signal } : {}) });
 
     let parsedJson: FFprobeProbeResult;
     let decoded: string | undefined;
@@ -582,15 +590,29 @@ export const getExperimentalArgs = (ffmpegExperimental: boolean) => (ffmpegExper
 
 export const getVideoTimescaleArgs = (videoTimebase: number | undefined) => (videoTimebase != null ? ['-video_track_timescale', String(videoTimebase)] : []);
 
-export async function createChaptersFromSegments({ paths, defaultChapterNames, useFileChapters }: {
+/** The cache belongs to one operation; never reuse stale metadata across exports. */
+export function createFileMetadataReader(signal?: AbortSignal) {
+  const pending = new Map<string, ReturnType<typeof readFileFfprobeMeta>>();
+  return (path: string) => {
+    let result = pending.get(path);
+    if (result == null) {
+      result = readFileFfprobeMeta(path, signal);
+      pending.set(path, result);
+    }
+    return result;
+  };
+}
+
+export async function createChaptersFromSegments({ paths, defaultChapterNames, useFileChapters, readMetadata = createFileMetadataReader() }: {
   paths: string[],
   defaultChapterNames?: (string | undefined)[] | undefined,
   useFileChapters?: boolean,
+  readMetadata?: ReturnType<typeof createFileMetadataReader>,
 }) {
   if (defaultChapterNames == null) return undefined;
 
   try {
-    const filesMeta = await pMap(paths, async (path) => readFileFfprobeMeta(path), { concurrency: 3 });
+    const filesMeta = await pMap(paths, readMetadata, { concurrency: 3 });
 
     let timeAt = 0;
 
