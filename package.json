@@ -168,7 +168,10 @@
       "buildResources": "build-resources"
     },
     "files": [
-      "out/**/*"
+      "out/**/*",
+      "!node_modules/electron/**/*",
+      "!node_modules/typescript/**/*",
+      "!node_modules/node-gyp/**/*"
     ],
     "asar": {
       "smartUnpack": false
