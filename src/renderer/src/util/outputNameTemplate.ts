@@ -13,6 +13,8 @@ import safeishEval from '../worker/eval';
 import { UserFacingError } from '../../errors';
 import type { FileFfprobeMeta } from '../ffmpeg';
 import { truncateFileName } from '../../../common/util';
+import { truncateLabel } from '../../../common/fileName';
+import mainApi from '../mainApi';
 import { parse as parsePath, sep as pathSep, join as pathJoin, normalize as pathNormalize, basename } from './path';
 
 
@@ -34,6 +36,7 @@ export interface GeneratedOutFileNames {
   problems: {
     error: string | undefined;
     sameAsInputFileNameWarning?: boolean;
+    blocking?: boolean;
   },
 }
 
@@ -241,7 +244,7 @@ function maybeTruncatePath(fileName: string, truncate: boolean) {
   ].join(pathSep);
 }
 
-async function generateWithFallback({ generate, desiredTemplate, defaultTemplate, safeOutputFileName, filePath, outputDir, maxLabelLength }: {
+async function generateWithFallback({ generate, desiredTemplate, defaultTemplate, safeOutputFileName, filePath, sourcePaths, outputDir, maxLabelLength }: {
   generate: (a: {
     template: string,
     sanitizeName: (name: string) => string,
@@ -251,12 +254,13 @@ async function generateWithFallback({ generate, desiredTemplate, defaultTemplate
   defaultTemplate: string,
   safeOutputFileName: boolean,
   filePath: string,
+  sourcePaths: string[],
   outputDir: string,
   maxLabelLength: number,
 }) {
   // Fields that did not come from the source file's name must be sanitized, because they may contain characters that are not supported by the target operating/file system
   // however we disable this when the user has chosen to (safeOutputFileName === false)
-  const sanitizeName = (name: string, safe: boolean) => (safe ? filenamify(name) : name).slice(0, Math.max(0, maxLabelLength));
+  const sanitizeName = (name: string, safe: boolean) => truncateLabel(safe ? filenamify(name) : name, maxLabelLength);
 
   let originalFileNames: string[] | undefined;
   let problems: GeneratedOutFileNames['problems'];
@@ -264,15 +268,30 @@ async function generateWithFallback({ generate, desiredTemplate, defaultTemplate
   try {
     originalFileNames = await generate({ template: desiredTemplate, sanitizeName: (name: string) => sanitizeName(name, safeOutputFileName), safeOutputFileName });
     problems = getTemplateProblems({ fileNames: originalFileNames, filePath, outputDir, safeOutputFileName });
+    if (problems.error == null) {
+      const conflict = await mainApi.checkOutputPathIdentity({ inputPaths: sourcePaths, outputPaths: originalFileNames.map((name) => pathJoin(outputDir, name)) });
+      if (conflict != null) {
+        problems = {
+          ...problems,
+          blocking: true,
+          error: conflict.kind === 'input'
+            ? i18n.t('At least one resulting file name is the same as the input path')
+            : i18n.t('Output file name template results in duplicate file names (you are trying to export multiple files with the same name). You can fix this for example by adding the "{{segNumVariable}}" variable.', { segNumVariable }),
+        };
+      }
+    } else if (hasDuplicates(originalFileNames) || originalFileNames.some((name) => pathNormalize(pathJoin(outputDir, name)) === pathNormalize(filePath))) {
+      problems.blocking = true;
+    }
   } catch (err) {
     console.warn(err);
     problems = {
+      blocking: originalFileNames != null,
       error: i18n.t('Template error: {{error}}', { error: err instanceof Error ? err.message : String(err) }),
     };
   }
 
   // Try again with default template if there was an error (also if the desired template is the default, because sanitizing may fix it) https://github.com/mifi/lossless-cut/issues/2986
-  if (problems.error != null) {
+  if (problems.error != null && !problems.blocking) {
     const fileNames = await generate({ template: defaultTemplate, sanitizeName: (name: string) => sanitizeName(name, true), safeOutputFileName: true });
     return { fileNames, originalFileNames, problems };
   }
@@ -349,6 +368,7 @@ export async function generateCutFileNames({ fileDuration, segmentsToExport: seg
     desiredTemplate,
     defaultTemplate: defaultCutFileTemplate,
     filePath: sourceFile.path,
+    sourcePaths: [sourceFile.path],
     outputDir,
     maxLabelLength,
     safeOutputFileName,
@@ -389,6 +409,7 @@ export async function generateCutMergedFileNames({ template: desiredTemplate, is
     desiredTemplate,
     defaultTemplate: defaultCutMergedFileTemplate,
     filePath: sourceFile.path,
+    sourcePaths: [sourceFile.path],
     outputDir,
     maxLabelLength,
     safeOutputFileName,
@@ -427,6 +448,7 @@ export async function generateMergedFileNames({ template: desiredTemplate, isCus
     desiredTemplate,
     defaultTemplate: defaultMergedFileTemplate,
     filePath: firstFile.path,
+    sourcePaths: sourceFiles.map((file) => file.path),
     outputDir,
     maxLabelLength,
     safeOutputFileName,

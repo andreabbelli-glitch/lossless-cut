@@ -24,6 +24,7 @@ import type { TunerType } from '../types';
 import Truncated from './Truncated';
 import { dangerColor } from '../colors';
 import OutDirSelector from './OutDirSelector.js';
+import useSettingsInteraction from '../hooks/useSettingsInteraction';
 
 // eslint-disable-next-line react/jsx-props-no-spreading
 const Button = ({ style, ...props }: ButtonProps) => <ButtonRaw style={{ padding: '.5em .9em', ...style }} {...props} />;
@@ -74,6 +75,7 @@ function Settings({
   setShowAdvancedSettings: (v: boolean) => void,
 }) {
   const { t } = useTranslation();
+  const qualityInteraction = useSettingsInteraction('captureFrameQuality');
 
   const { customOutDir, keyframeCut, toggleKeyframeCut, timecodeFormat, setTimecodeFormat, invertCutSegments, setInvertCutSegments, askBeforeClose, setAskBeforeClose, enableImportChapters, setEnableImportChapters, enableAskForFileOpenAction, setEnableAskForFileOpenAction, autoSaveProjectFile, setAutoSaveProjectFile, invertTimelineScroll, setInvertTimelineScroll, language, setLanguage, hideNotifications, setHideNotifications, hideOsNotifications, setHideOsNotifications, autoLoadTimecode, setAutoLoadTimecode, enableAutoHtml5ify, setEnableAutoHtml5ify, customFfPath, setCustomFfPath, storeProjectInWorkingDir, mouseWheelZoomModifierKey, setMouseWheelZoomModifierKey, mouseWheelFrameSeekModifierKey, setMouseWheelFrameSeekModifierKey, mouseWheelKeyframeSeekModifierKey, setMouseWheelKeyframeSeekModifierKey, segmentMouseModifierKey, setSegmentMouseModifierKey, captureFrameMethod, setCaptureFrameMethod, captureFrameQuality, setCaptureFrameQuality, captureFrameFileNameFormat, setCaptureFrameFileNameFormat, enableNativeHevc, setEnableNativeHevc, enableUpdateCheck, setEnableUpdateCheck, allowMultipleInstances, setAllowMultipleInstances, preferStrongColors, setPreferStrongColors, theme, setTheme, videoFit, setVideoFit, treatInputFileModifiedTimeAsStart, setTreatInputFileModifiedTimeAsStart, treatOutputFileModifiedTimeAsStart, setTreatOutputFileModifiedTimeAsStart, exportConfirmEnabled, toggleExportConfirmEnabled, storeWindowBounds, setStoreWindowBounds, reducedMotion, setReducedMotion, ffmpegHwaccel, setFfmpegHwaccel } = useUserSettings();
 
@@ -353,7 +355,7 @@ function Settings({
         <Row>
           <KeyCell>{t('Snapshot capture quality')}</KeyCell>
           <td>
-            <input type="range" min={1} max={1000} style={{ width: 200 }} value={Math.round(captureFrameQuality * 1000)} onChange={(e) => setCaptureFrameQuality(Math.max(Math.min(1, parseInt(e.target.value, 10) / 1000), 0))} /><br />
+            <input type="range" min={1} max={1000} style={{ width: 200 }} value={Math.round(captureFrameQuality * 1000)} onChange={(e) => setCaptureFrameQuality(Math.max(Math.min(1, parseInt(e.target.value, 10) / 1000), 0))} onPointerDown={qualityInteraction.onPointerDown} onPointerUp={qualityInteraction.onPointerUp} onPointerCancel={qualityInteraction.onPointerCancel} onLostPointerCapture={qualityInteraction.onLostPointerCapture} onKeyDown={qualityInteraction.onKeyDown} onKeyUp={qualityInteraction.onKeyUp} onBlur={qualityInteraction.onBlur} /><br />
             {Math.round(captureFrameQuality * 100)}%
           </td>
         </Row>

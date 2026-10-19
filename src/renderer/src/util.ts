@@ -14,6 +14,7 @@ import type { EnableImportChapters, Html5ifyMode } from '../../common/types';
 import { UserFacingError } from '../errors';
 import type { FFprobeFormat } from '../../common/ffprobe';
 import { dirname, parse as parsePath, join, extname, isAbsolute, resolve, basename } from './util/path';
+import { sanitizeFileName } from '../../common/fileName';
 
 const { stat, lstat, readdir, utimes, unlink, open, access, constants: { R_OK, W_OK } } = window.require('node:fs/promises');
 const remote = window.require('@electron/remote');
@@ -179,9 +180,7 @@ export async function transferTimestamps({ inPath, outPath, cutFrom = 0, cutTo: 
 }
 
 export function filenamify(name: string) {
-  // \p{L}\p{N} are unicode letters and numbers
-  // Keep the hyphen last so it is treated literally rather than as a character-class range.
-  return name.replaceAll(/[^\p{L}\p{N} ._-]/gu, '_');
+  return sanitizeFileName(name);
 }
 
 // eslint-disable-next-line space-before-function-paren

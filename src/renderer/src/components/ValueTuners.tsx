@@ -77,7 +77,7 @@ function ValueTuners({ type, onFinished }: { type: TunerType, onFinished: () => 
 
   const resetToDefault = useCallback(() => setValue(defaultValue), [defaultValue, setValue]);
 
-  return <ValueTuner title={title} value={value} setValue={setValue} onFinished={onFinished} max={max} min={min} resetToDefault={resetToDefault} resolution={resolution} decimals={decimals} />;
+  return <ValueTuner settingKey={type} title={title} value={value} setValue={setValue} onFinished={onFinished} max={max} min={min} resetToDefault={resetToDefault} resolution={resolution} decimals={decimals} />;
 }
 
 

@@ -17,7 +17,7 @@ export default function useErrorHandling() {
   /**
    * Run an operation with error handling
    */
-  async function withErrorHandling(operation: () => Promise<void>, errorMsg?: string) {
+  const withErrorHandling = useCallback(async (operation: () => Promise<void>, errorMsg?: string) => {
     try {
       await operation();
     } catch (err) {
@@ -31,7 +31,7 @@ export default function useErrorHandling() {
 
       handleError({ title: errorMsg, err });
     }
-  }
+  }, [handleError]);
 
   return {
     withErrorHandling,

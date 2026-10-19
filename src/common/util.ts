@@ -1,4 +1,5 @@
 import type { AudioChannelInfo, FfmpegHwAccel } from './types.ts';
+import { splitGraphemes } from './fileName.js';
 
 export const parseFfprobeDuration = (durationStr: string | undefined) => (
   durationStr != null ? parseFloat(durationStr) : undefined
@@ -19,7 +20,7 @@ function getCharUtf8Length(char: string) {
 }
 
 // File systems limit the length of file names in UTF-8 bytes (e.g. ext4, APFS) or UTF-16 code units (NTFS)
-const getCharLength = (char: string, utf16: boolean) => (utf16 ? char.length : getCharUtf8Length(char));
+const getCharLength = (char: string, utf16: boolean) => (utf16 ? char.length : [...char].reduce((length, point) => length + getCharUtf8Length(point), 0));
 
 function takeChars(chars: string[], maxLength: number, utf16: boolean) {
   const ret: string[] = [];
@@ -44,7 +45,7 @@ export function truncateFileName(name: string, maxLength: number, utf16 = false)
   // only treat a short suffix as an extension, so that a dot early in the name doesn't make us exceed the limit
   const ext = extIndex > 0 && name.length - extIndex <= 10 ? name.slice(extIndex) : '';
   const stem = name.slice(0, name.length - ext.length);
-  const chars = [...stem];
+  const chars = splitGraphemes(stem);
 
   const budget = maxLength - getLength(ext) - getLength(ellipsis);
   const head = takeChars(chars, Math.floor(budget / 2), utf16);

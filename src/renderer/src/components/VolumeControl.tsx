@@ -4,6 +4,7 @@ import { FaVolumeMute, FaVolumeUp } from 'react-icons/fa';
 import { useTranslation } from 'react-i18next';
 
 import useActionTitle from '../hooks/useActionTitle';
+import useSettingsInteraction from '../hooks/useSettingsInteraction';
 
 
 function VolumeControl({ playbackVolume, setPlaybackVolume, onToggleMutedClick }: {
@@ -15,6 +16,7 @@ function VolumeControl({ playbackVolume, setPlaybackVolume, onToggleMutedClick }
   const timeoutRef = useRef<number>(undefined);
   const { t } = useTranslation();
   const actionTitle = useActionTitle();
+  const interaction = useSettingsInteraction('playbackVolume');
 
   useEffect(() => {
     const clear = () => clearTimeout(timeoutRef.current);
@@ -24,7 +26,6 @@ function VolumeControl({ playbackVolume, setPlaybackVolume, onToggleMutedClick }
   }, [playbackVolume, volumeControlVisible]);
 
   const onVolumeChange = useCallback<ChangeEventHandler<HTMLInputElement>>((e) => {
-    e.target.blur();
     setPlaybackVolume(Number(e.target.value) / 100);
   }, [setPlaybackVolume]);
 
@@ -48,6 +49,13 @@ function VolumeControl({ playbackVolume, setPlaybackVolume, onToggleMutedClick }
           value={playbackVolume * 100}
           style={{ height: 30 }}
           onChange={onVolumeChange}
+          onPointerDown={interaction.onPointerDown}
+          onPointerUp={interaction.onPointerUp}
+          onPointerCancel={interaction.onPointerCancel}
+          onLostPointerCapture={interaction.onLostPointerCapture}
+          onKeyDown={interaction.onKeyDown}
+          onKeyUp={interaction.onKeyUp}
+          onBlur={interaction.onBlur}
         />
       )}
 

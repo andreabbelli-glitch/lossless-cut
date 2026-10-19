@@ -7,9 +7,12 @@ import styles from './ValueTuner.module.css';
 import Switch from './Switch';
 import Button from './Button';
 import { primaryColor } from '../colors';
+import useSettingsInteraction from '../hooks/useSettingsInteraction';
+import type { TunerType } from '../types';
 
 
-function ValueTuner({ title, value, setValue, onFinished, resolution, decimals, min: minIn = 0, max: maxIn = 1, resetToDefault }: {
+function ValueTuner({ settingKey, title, value, setValue, onFinished, resolution, decimals, min: minIn = 0, max: maxIn = 1, resetToDefault }: {
+  settingKey: TunerType,
   title: string,
   value: number,
   setValue: (v: number) => void,
@@ -21,12 +24,12 @@ function ValueTuner({ title, value, setValue, onFinished, resolution, decimals, 
   resetToDefault: () => void,
 }) {
   const { t } = useTranslation();
+  const interaction = useSettingsInteraction(settingKey);
 
   const [min, setMin] = useState(minIn);
   const [max, setMax] = useState(maxIn);
 
   const onChange = useCallback<ChangeEventHandler<HTMLInputElement>>((e) => {
-    e.target.blur();
     setValue(Math.min(Math.max(min, ((Number(e.target.value) / resolution) * (max - min)) + min), max));
   }, [max, min, resolution, setValue]);
 
@@ -61,7 +64,7 @@ function ValueTuner({ title, value, setValue, onFinished, resolution, decimals, 
       </div>
 
       <div style={{ marginBottom: '.3em' }}>
-        <input style={{ width: '100%' }} type="range" min="0" max="1000" step="1" value={((value - min) / (max - min)) * resolution} onChange={onChange} />
+        <input style={{ width: '100%' }} type="range" min="0" max={resolution} step="1" value={((value - min) / (max - min)) * resolution} onChange={onChange} onPointerDown={interaction.onPointerDown} onPointerUp={interaction.onPointerUp} onPointerCancel={interaction.onPointerCancel} onLostPointerCapture={interaction.onLostPointerCapture} onKeyDown={interaction.onKeyDown} onKeyUp={interaction.onKeyUp} onBlur={interaction.onBlur} />
       </div>
 
       <div style={{ display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: '.3em' }}>
