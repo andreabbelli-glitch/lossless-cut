@@ -3,6 +3,11 @@ import { describe, expect, test } from 'vitest';
 import { parseFfmpegProgressLine } from './progress';
 
 describe('parseFfmpegProgressLine', () => {
+  test('unavailable and negative progress are absent, malformed progress still fails', () => {
+    expect(parseFfmpegProgressLine({ line: 'size= 0kB time=N/A bitrate=N/A    ', duration: 10 })).toBeUndefined();
+    expect(parseFfmpegProgressLine({ line: 'size= 0kB time=-00:00:00.01 bitrate=N/A    ', duration: 10 })).toBeUndefined();
+    expect(() => parseFfmpegProgressLine({ line: 'size= 0kB time=broken bitrate=N/A    ', duration: 10 })).toThrow();
+  });
   test('parse video', () => {
     const str = 'frame= 2285 fps=135 q=4.0 Lsize=N/A time=00:01:31.36 bitrate=N/A speed=5.38x    ';
     expect(parseFfmpegProgressLine({ line: str, duration: 60 + 31.36 })).toBe(1);

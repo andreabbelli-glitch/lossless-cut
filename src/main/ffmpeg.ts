@@ -18,6 +18,9 @@ import { parseFfmpegProgressLine } from './progress.js';
 import { formatFfmpegNumber, getFixChannelLayoutFilter, getHwaccelArgs, parseFfprobeDuration } from '../common/util.js';
 import { getFfmpegJpegQuality, parseBlackDetectLine, parseSilenceDetectLine } from './ffmpegUtil.js';
 import { throwIfDisabledNetworking } from './networking.js';
+import { combineFfSignals, getFfOperationSignal } from './ffmpegOperations.js';
+
+export { createFfOperation, abortFfOperation, finishFfOperation } from './ffmpegOperations.js';
 
 
 // cannot use process.kill: https://github.com/sindresorhus/execa/issues/1177
@@ -117,11 +120,6 @@ function handleProgress(
 }
 
 function getExecaOptions<T extends ExecaOptions>({ env, cancelSignal, ...rest }: T) {
-  // This is a ugly hack to please execa which expects cancelSignal to be a prototype of AbortSignal
-  // however this gets lost during @electron/remote passing
-  // https://github.com/sindresorhus/execa/blob/c8cff27a47b6e6f1cfbfec2bf7fa9dcd08cefed1/lib/terminate/cancel.js#L5
-  if (cancelSignal != null) Object.setPrototypeOf(cancelSignal, new AbortController().signal);
-
   const execaOptions: Pick<ExecaOptions, 'env'> = {
     ...(cancelSignal != null && { cancelSignal }),
     ...rest,
@@ -144,13 +142,14 @@ function getExecaBufferOptions(opts: ExecaOptions = {}) {
 }
 
 // todo collect warnings from ffmpeg output and show them after export? example: https://github.com/mifi/lossless-cut/issues/1469
-function runFfmpegProcess(args: readonly string[], customExecaOptions?: ExecaOptions, additionalOptions?: { logCli?: boolean }) {
+function runFfmpegProcess(args: readonly string[], customExecaOptions?: ExecaOptions, additionalOptions?: { logCli?: boolean, operationId?: string | undefined }) {
   const ffmpegPath = getFfmpegPath();
   const { logCli = true } = additionalOptions ?? {};
   if (logCli) logger.info(getFfCommandLine('ffmpeg', args));
 
   const abortController = new AbortController();
-  const process = execa(ffmpegPath, args, getExecaBufferOptions({ ...customExecaOptions, cancelSignal: abortController.signal }));
+  const cancelSignal = combineFfSignals(abortController.signal, customExecaOptions?.cancelSignal, getFfOperationSignal(additionalOptions?.operationId));
+  const process = execa(ffmpegPath, args, getExecaBufferOptions({ ...customExecaOptions, cancelSignal }));
 
   const wrapped = { process, abortController };
 
@@ -194,18 +193,52 @@ export async function runFfmpegWithProgress({ ffmpegArgs, duration, onProgress }
   return process;
 }
 
-export async function runFfprobe(args: readonly string[], { timeout = isDev ? 10000 : 30000, logCli = true } = {}) {
+function runFfprobeProcess(args: readonly string[], { timeout = isDev ? 10000 : 30000, logCli = true, operationId }: { timeout?: number, logCli?: boolean, operationId?: string | undefined } = {}, options: ExecaOptions = {}) {
   const ffprobePath = getFfprobePath();
   if (logCli) logger.info(getFfCommandLine('ffprobe', args));
-  const ps = execa(ffprobePath, args, getExecaBufferOptions());
-  const timer = setTimeout(() => {
+  const ps = execa(ffprobePath, args, getExecaBufferOptions({ ...options, cancelSignal: combineFfSignals(getFfOperationSignal(operationId), options.cancelSignal) }));
+  const timer = timeout > 0 ? setTimeout(() => {
     logger.warn('killing timed out ffprobe');
     ps.kill();
-  }, timeout);
+  }, timeout) : undefined;
+  // Observe completion immediately, including when a streaming caller is still
+  // consuming stdout. Never leave the child rejection unhandled.
+  ps.then(() => clearTimeout(timer), () => clearTimeout(timer));
+  return ps;
+}
+
+export const runFfprobe = async (...args: Parameters<typeof runFfprobeProcess>) => runFfprobeProcess(...args);
+// Native main-process consumers need immediate streams; renderer calls use the
+// awaited wrappers below and never transfer an Execa process over the bridge.
+export const spawnFfprobe = runFfprobeProcess;
+export const spawnFfmpeg = runFfmpegProcess;
+
+export async function readKeyframeTimes({ filePath, from, to, streamIndex, operationId }: {
+  filePath: string, from: number, to: number, streamIndex: number, operationId?: string | undefined,
+}) {
+  const ps = runFfprobeProcess([
+    '-v', 'error', '-read_intervals', `${from}%${to}`, '-show_packets', '-select_streams', String(streamIndex),
+    '-show_entries', 'packet=pts_time,flags', '-of', 'compact=p=0:nk=0', filePath,
+  ], { timeout: 0, logCli: false, operationId }, { buffer: { stdout: false, stderr: true } });
+  assert(ps.stdout != null);
+  const lines = readline.createInterface({ input: ps.stdout });
+  const times: number[] = [];
   try {
-    return await ps;
+    for await (const line of lines) {
+      if (/(?:^|\|)flags=K/.test(line)) {
+        const match = line.match(/(?:^|\|)pts_time=([^|]+)/);
+        const time = match == null ? NaN : Number(match[1]);
+        if (Number.isFinite(time)) times.push(time);
+      }
+    }
+    await ps;
+    return times.sort((a, b) => a - b);
+  } catch (err) {
+    ps.kill();
+    await Promise.allSettled([ps]);
+    throw err;
   } finally {
-    clearTimeout(timer);
+    lines.close();
   }
 }
 
@@ -213,7 +246,7 @@ export interface Waveform {
   buffer: Buffer,
 }
 
-export async function renderWaveformPng({ filePath, start, duration, resample, color, streamIndex, timeout }: {
+export async function renderWaveformPng({ filePath, start, duration, resample, color, streamIndex, timeout, operationId, fastSeek = false }: {
   filePath: string,
   start?: number,
   duration?: number,
@@ -221,13 +254,19 @@ export async function renderWaveformPng({ filePath, start, duration, resample, c
   color: string,
   streamIndex: number,
   timeout?: number,
+  operationId?: string | undefined,
+  fastSeek?: boolean,
 }): Promise<Waveform> {
+  // Opted into only for the container/codec combinations verified by the
+  // caller. Keep a decoded-audio preroll and the existing precise output seek.
+  const inputSeek = fastSeek && start != null ? Math.max(0, start - 10) : 0;
   const args1 = [
     '-hide_banner',
+    ...(inputSeek > 0 ? ['-ss', String(inputSeek)] : []),
     '-i', filePath,
     '-vn',
     '-map', `0:${streamIndex}`,
-    ...(start != null ? ['-ss', String(start)] : []),
+    ...(start != null ? ['-ss', String(start - inputSeek)] : []),
     ...(duration != null ? ['-t', String(duration)] : []),
     ...(resample != null ? [
       // the operation is faster if we resample
@@ -261,13 +300,13 @@ export async function renderWaveformPng({ filePath, start, duration, resample, c
   let ps1: ResultPromise<{ encoding: 'buffer' }> | undefined;
   let ps2: ResultPromise<{ encoding: 'buffer' }> | undefined;
   try {
-    ps1 = runFfmpegProcess(args1, { buffer: false, ...(timeout != null && { timeout }) }, { logCli: false });
-    ps2 = runFfmpegProcess(args2, timeout != null ? { timeout } : undefined, { logCli: false });
+    ps1 = runFfmpegProcess(args1, { buffer: false, ...(timeout != null && { timeout }) }, { logCli: false, operationId });
+    ps2 = runFfmpegProcess(args2, timeout != null ? { timeout } : undefined, { logCli: false, operationId });
     assert(ps1.stdout != null);
     assert(ps2.stdin != null);
     ps1.stdout.pipe(ps2.stdin);
 
-    const { stdout } = await ps2;
+    const [, { stdout }] = await Promise.all([ps1, ps2]);
 
     return {
       buffer: Buffer.from(stdout),
@@ -275,6 +314,7 @@ export async function renderWaveformPng({ filePath, start, duration, resample, c
   } catch (err) {
     ps1?.kill();
     ps2?.kill();
+    await Promise.allSettled([ps1, ps2]);
     throw err;
   }
 }
@@ -306,8 +346,26 @@ interface DetectedSegment {
   end: number,
 }
 
+function limitedSegmentEmitter(maxSegments: number | undefined, emit: (segment: DetectedSegment) => void, stop: () => void) {
+  let count = 0;
+  let error: Error | undefined;
+  return {
+    emit(segment: DetectedSegment) {
+      if (error != null) return;
+      if (maxSegments != null && count >= maxSegments) {
+        error = new Error('Too many detected segments');
+        stop();
+        return;
+      }
+      count += 1;
+      emit(segment);
+    },
+    get error() { return error; },
+  };
+}
+
 // https://stackoverflow.com/questions/35675529/using-ffmpeg-how-to-do-a-scene-change-detection-with-timecode
-export async function detectSceneChanges({ filePath, streamId, minChange, onProgress, onSegmentDetected, from, to, ffmpegHwaccel }: {
+export async function detectSceneChanges({ filePath, streamId, minChange, onProgress, onSegmentDetected, from, to, ffmpegHwaccel, maxSegments }: {
   filePath: string,
   streamId: number | undefined
   minChange: number | string,
@@ -316,6 +374,7 @@ export async function detectSceneChanges({ filePath, streamId, minChange, onProg
   from: number,
   to: number,
   ffmpegHwaccel: FfmpegHwAccel,
+  maxSegments?: number,
 }) {
   const args = [
     '-hide_banner',
@@ -326,33 +385,39 @@ export async function detectSceneChanges({ filePath, streamId, minChange, onProg
     '-f', 'null', '-',
   ];
   const process = runFfmpegProcess(args, { buffer: false });
+  const segments = limitedSegmentEmitter(maxSegments, onSegmentDetected, () => process.kill());
 
   handleProgress(process, to - from, onProgress);
 
   assert(process.stdout != null);
   const rl = readline.createInterface({ input: process.stdout });
 
-  let lastTime: number | undefined;
+  let lastTime = 0;
 
   rl.on('line', (line) => {
     // eslint-disable-next-line unicorn/better-regex
     const match = line.match(/^frame:\d+\s+pts:\d+\s+pts_time:([\d.]+)/);
     if (!match) return;
     const time = parseFloat(match[1]!);
-    if (!Number.isNaN(time)) {
-      if (lastTime != null && time > lastTime) {
-        onSegmentDetected({ start: from + lastTime, end: from + time });
-      }
+    if (!Number.isNaN(time) && time > lastTime && time < to - from) {
+      segments.emit({ start: from + lastTime, end: from + time });
       lastTime = time;
     }
   });
 
-  await process;
+  try {
+    await process;
+  } catch (err) {
+    throw segments.error ?? err;
+  }
+
+  if (from + lastTime < to) segments.emit({ start: from + lastTime, end: to });
+  if (segments.error != null) throw segments.error;
 
   return { ffmpegArgs: args };
 }
 
-async function detectIntervals({ filePath, customArgs, onProgress, onSegmentDetected, from, to, matchLineTokens, boundingMode, ffmpegHwaccel }: {
+async function detectIntervals({ filePath, customArgs, onProgress, onSegmentDetected, from, to, matchLineTokens, boundingMode, ffmpegHwaccel, maxSegments }: {
   filePath: string,
   customArgs: string[],
   onProgress: (p: number) => void,
@@ -362,6 +427,7 @@ async function detectIntervals({ filePath, customArgs, onProgress, onSegmentDete
   matchLineTokens: (line: string) => DetectedSegment | undefined,
   boundingMode: boolean,
   ffmpegHwaccel: FfmpegHwAccel,
+  maxSegments?: number,
 }) {
   const args = [
     '-hide_banner',
@@ -371,6 +437,7 @@ async function detectIntervals({ filePath, customArgs, onProgress, onSegmentDete
     '-f', 'null', '-',
   ];
   const process = runFfmpegProcess(args, { buffer: false });
+  const segments = limitedSegmentEmitter(maxSegments, onSegmentDetected, () => process.kill());
 
   let lastMidpoint: number | undefined;
 
@@ -380,25 +447,31 @@ async function detectIntervals({ filePath, customArgs, onProgress, onSegmentDete
     const { start, end } = match;
 
     if (boundingMode) {
-      onSegmentDetected({ start: from + start, end: from + end });
+      segments.emit({ start: from + start, end: from + end });
     } else {
       const midpoint = start + ((end - start) / 2);
 
-      onSegmentDetected({ start: from + (lastMidpoint ?? 0), end: from + midpoint });
+      segments.emit({ start: from + (lastMidpoint ?? 0), end: from + midpoint });
       lastMidpoint = midpoint;
     }
   }
 
   handleProgress(process, to - from, onProgress, customMatcher);
 
-  await process;
+  try {
+    await process;
+  } catch (err) {
+    throw segments.error ?? err;
+  }
 
   if (!boundingMode && lastMidpoint != null) {
-    onSegmentDetected({
+    segments.emit({
       start: from + lastMidpoint,
       end: to,
     });
   }
+
+  if (segments.error != null) throw segments.error;
 
   return { ffmpegArgs: args };
 }
@@ -415,6 +488,7 @@ export async function blackDetect({ streamId, filterOptions, ...rest }: {
   from: number,
   to: number,
   ffmpegHwaccel: FfmpegHwAccel,
+  maxSegments?: number,
 }) {
   return detectIntervals({
     ...rest,
@@ -435,6 +509,7 @@ export async function silenceDetect({ streamId, filterOptions, ...rest }: {
   onSegmentDetected: (p: DetectedSegment) => void,
   from: number, to: number,
   ffmpegHwaccel: FfmpegHwAccel,
+  maxSegments?: number,
 }) {
   return detectIntervals({
     ...rest,
@@ -482,10 +557,11 @@ export async function captureFrames({ from, to, videoPath, outPathTemplate, qual
         filter != null ? [
           '-vf', filter,
           // https://superuser.com/questions/1336285/use-ffmpeg-for-thumbnail-selections
-          ...(framePts ? ['-frame_pts', '1'] : []),
-          '-vsync', '0', // else we get a ton of duplicates (thumbnail filter)
+          ...(!framePts ? ['-fps_mode', 'passthrough'] : []), // don't duplicate the selected frames
         ] : [])
     ),
+    // Timestamp filenames use a known clock, including VFR, filters and markers.
+    ...(framePts ? ['-frame_pts', '1', '-enc_time_base:v', '1/1000000', '-fps_mode', 'passthrough'] : []),
     ...getCodecOpts(captureFormat),
     '-f', 'image2',
     '-y', outPathTemplate,

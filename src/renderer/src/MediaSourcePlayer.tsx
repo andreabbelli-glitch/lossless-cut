@@ -2,6 +2,7 @@ import type { CSSProperties, RefObject, ReactEventHandler, FocusEventHandler } f
 import { useEffect, useRef, useState, useCallback, useMemo, memo } from 'react';
 import invariant from 'tiny-invariant';
 import debounce from 'lodash/debounce.js';
+import type { DebouncedFunc } from 'lodash';
 import { FaVideo } from 'react-icons/fa';
 
 import isDev from './isDev';
@@ -29,6 +30,7 @@ async function startPlayback({ path, slaveVideo, masterVideo, videoStreamIndex, 
   onWaiting: () => void,
   ffmpegHwaccel: FfmpegHwAccel,
 }) {
+  if (signal.aborted) return;
   let canPlay = false;
   let bufferEndTime: number | undefined;
   let bufferStartTime = seekTo;
@@ -47,7 +49,7 @@ async function startPlayback({ path, slaveVideo, masterVideo, videoStreamIndex, 
     mediaSourceProcess?.abort();
     if (objectUrl != null) URL.revokeObjectURL(objectUrl);
     slaveVideo.removeAttribute('src');
-  });
+  }, { once: true });
 
   // See chrome://media-internals
 
@@ -93,6 +95,7 @@ async function startPlayback({ path, slaveVideo, masterVideo, videoStreamIndex, 
   mediaSourceProcess = createMediaSourceStream({ path, videoStreamIndex, audioStreams, seekTo, size, fps, rotate, ffmpegHwaccel });
   console.log('Waiting for media source process to emit first data...');
   const readChunk = await mediaSourceProcess.promise;
+  if (signal.aborted) return;
   if (readChunk == null) {
     if (signal.aborted) return;
     throw new Error('Media source process did not initialize');
@@ -106,13 +109,24 @@ async function startPlayback({ path, slaveVideo, masterVideo, videoStreamIndex, 
   // eslint-disable-next-line no-param-reassign
   slaveVideo.src = objectUrl;
 
-  await new Promise((resolve) => mediaSource.addEventListener('sourceopen', resolve, { once: true }));
+  await new Promise<void>((resolve) => {
+    const done = () => {
+      mediaSource.removeEventListener('sourceopen', done);
+      signal.removeEventListener('abort', done);
+      resolve();
+    };
+    mediaSource.addEventListener('sourceopen', done, { once: true });
+    signal.addEventListener('abort', done, { once: true });
+  });
+  if (signal.aborted) return;
   // console.log(mediaSource.readyState); // open
 
   const sourceBuffer = mediaSource.addSourceBuffer(mimeCodec);
   sourceBuffer.timestampOffset = seekTo - getFrameDuration(fps); // subtract 1 frame in order to attempt to avoid this issue: https://github.com/mifi/lossless-cut/issues/2591#issuecomment-3478018458
 
-  signal.addEventListener('abort', () => sourceBuffer.abort());
+  signal.addEventListener('abort', () => {
+    if (mediaSource.readyState === 'open') sourceBuffer.abort();
+  }, { once: true });
 
   const getBufferEndTime = () => {
     if (mediaSource.readyState !== 'open') {
@@ -132,6 +146,7 @@ async function startPlayback({ path, slaveVideo, masterVideo, videoStreamIndex, 
   let firstChunkReceived = false;
 
   const processChunk = async () => {
+    if (signal.aborted) return;
     try {
       const chunk = await readChunk();
       if (chunk == null) {
@@ -148,8 +163,9 @@ async function startPlayback({ path, slaveVideo, masterVideo, videoStreamIndex, 
 
       sourceBuffer.appendBuffer(chunk as BufferSource);
     } catch (err) {
+      if (signal.aborted) return;
       console.error('processChunk failed', err);
-      processChunkTimeout = setTimeout(processChunk, 1000);
+      onResetNeeded();
     }
   };
 
@@ -338,11 +354,15 @@ function MediaSourcePlayer({ rotate, filePath, videoStream, audioStreams, master
     const canvas = canvasRef.current;
     invariant(canvas != null);
 
-    let abortController: AbortController;
-    let startDebounced: () => void;
+    let disposed = false;
+    let abortController: AbortController | undefined;
+    let startDebounced: DebouncedFunc<() => Promise<void>>;
 
     const start = async () => {
-      abortController = new AbortController();
+      if (disposed) return;
+      abortController?.abort();
+      const controller = new AbortController();
+      abortController = controller;
 
       canvas.width = video.videoWidth;
       canvas.height = video.videoHeight;
@@ -365,7 +385,7 @@ function MediaSourcePlayer({ rotate, filePath, videoStream, audioStreams, master
         else if (mediaSourceQuality === 1) fps = 15;
 
         await startPlayback({
-          signal: abortController.signal,
+          signal: controller.signal,
           path: filePath,
           slaveVideo: video,
           masterVideo,
@@ -376,20 +396,23 @@ function MediaSourcePlayer({ rotate, filePath, videoStream, audioStreams, master
           fps,
           rotate,
           onCanPlay: () => {
+            if (disposed || controller.signal.aborted) return;
             setLoading(false);
             setShowCanvas(false);
           },
           onResetNeeded: () => {
-            abortController.abort();
+            if (disposed || controller.signal.aborted) return;
+            controller.abort();
             startDebounced();
           },
           onWaiting: () => {
+            if (disposed || controller.signal.aborted) return;
             setLoading(true);
           },
           ffmpegHwaccel,
         });
       } catch (err) {
-        console.error('Preview failed', err);
+        if (!disposed && !controller.signal.aborted) console.error('Preview failed', err);
       }
     };
 
@@ -397,7 +420,11 @@ function MediaSourcePlayer({ rotate, filePath, videoStream, audioStreams, master
 
     startDebounced();
 
-    return () => abortController.abort();
+    return () => {
+      disposed = true;
+      startDebounced.cancel();
+      abortController?.abort();
+    };
     // Important that we also have eventId in the deps, so that we can restart the preview when the eventId changes
   }, [audioStreamsForPreview, ffmpegHwaccel, filePath, masterVideoRef, mediaSourceQuality, rotate, videoStream]);
 

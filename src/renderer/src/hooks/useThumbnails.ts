@@ -33,7 +33,10 @@ export default ({ filePath, zoomedDuration, zoomWindowStartTime, showThumbnails 
         invariant(debounced.zoomedDuration != null);
 
         const addThumbnail = (t: Thumbnail) => {
-          if (abortController.signal.aborted) return; // because the bridge is async
+          if (abortController.signal.aborted) {
+            URL.revokeObjectURL(t.url);
+            return;
+          }
           thumbnails2.push(t);
           setThumbnails((v) => [...v, t]);
         };

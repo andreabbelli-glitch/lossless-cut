@@ -1,5 +1,5 @@
 import type { ReactEventHandler } from 'react';
-import { useCallback, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { ChromiumHTMLVideoElement, PlaybackMode } from '../types';
 import { showPlaybackFailedMessage } from '../swal';
 
@@ -36,6 +36,17 @@ export default ({ filePath }: { filePath: string | undefined }) => {
   const seekingRef = useRef<NodeJS.Timeout | undefined>(undefined);
   const seekToRef = useRef<number>(undefined);
 
+  const clearPendingSeek = useCallback(() => {
+    clearTimeout(seekingRef.current);
+    seekingRef.current = undefined;
+    seekToRef.current = undefined;
+  }, []);
+
+  useEffect(() => {
+    clearPendingSeek();
+    return clearPendingSeek;
+  }, [clearPendingSeek, filePath]);
+
   const smoothSeek = useCallback((seekTo: number) => {
     if (seekingRef.current) {
       seekToRef.current = seekTo;
@@ -44,6 +55,9 @@ export default ({ filePath }: { filePath: string | undefined }) => {
       // safety precaution:
       seekingRef.current = setTimeout(() => {
         seekingRef.current = undefined;
+        const pending = seekToRef.current;
+        seekToRef.current = undefined;
+        if (pending != null && videoRef.current != null) videoRef.current.currentTime = pending;
       }, 1000);
     }
   }, []);
@@ -68,7 +82,7 @@ export default ({ filePath }: { filePath: string | undefined }) => {
   const seekAbs = useCallback((val: number | undefined) => {
     if (filePath == null) return;
     const video = videoRef.current;
-    if (video == null || val == null || Number.isNaN(val)) return;
+    if (video == null || val == null || !Number.isFinite(val)) return;
     let outVal = val;
     if (outVal < 0) outVal = 0;
     if (outVal > video.duration) outVal = video.duration;
@@ -99,9 +113,10 @@ export default ({ filePath }: { filePath: string | undefined }) => {
   }, [onPlayingChange]);
 
   const onVideoAbort = useCallback(() => {
+    clearPendingSeek();
     setPlaying(false); // we want to preserve current time https://github.com/mifi/lossless-cut/issues/1674#issuecomment-1658937716
     setPlaybackMode(undefined);
-  }, [setPlaybackMode]);
+  }, [clearPendingSeek, setPlaybackMode]);
 
   const onStartPlaying = useCallback(() => onPlayingChange(true), [onPlayingChange]);
 

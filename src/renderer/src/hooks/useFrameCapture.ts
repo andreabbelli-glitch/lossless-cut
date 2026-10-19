@@ -32,7 +32,7 @@ export default ({ appendFfmpegCommandLog, formatTimecode, treatInputFileModified
   treatOutputFileModifiedTimeAsStart: boolean | undefined | null,
   fileDuration: number | undefined,
 }) => {
-  const captureFramesRange = useCallback(async ({ customOutDir, filePath, fps, fromTime, toTime, estimatedMaxNumFiles, captureFormat, quality, filter, onProgress, outputTimestamps }: {
+  const captureFramesRange = useCallback(async ({ customOutDir, filePath, fromTime, toTime, estimatedMaxNumFiles, captureFormat, quality, filter, onProgress, outputTimestamps }: {
     customOutDir: string | undefined,
     filePath: string,
     fps: number,
@@ -64,7 +64,7 @@ export default ({ appendFfmpegCommandLog, formatTimecode, treatInputFileModified
     // capture frames with timestamps
     // see https://github.com/mifi/lossless-cut/issues/1139
 
-    const tmpSuffix = 'llc-tmp-frame-capture-';
+    const tmpSuffix = `llc-tmp-frame-capture-${crypto.randomUUID()}-`;
     const outPathTemplate = getSuffixedOutPath({ customOutDir, filePath, nameSuffix: getSuffix(`${tmpSuffix}%d`) });
     const args = await ffmpeg.captureFrames({ from: fromTime, to: toTime, videoPath: filePath, outPathTemplate, captureFormat, quality, filter, framePts: true, onProgress });
     appendFfmpegCommandLog(args);
@@ -74,17 +74,17 @@ export default ({ appendFfmpegCommandLog, formatTimecode, treatInputFileModified
 
     const matches = files.flatMap((fileName) => {
       const escapedRegexp = escapeRegExp(getSuffixedFileName(filePath, tmpSuffix));
-      const regexp = `^${escapedRegexp}(\\d+)`;
+      const regexp = `^${escapedRegexp}(-?\\d+)\\.${captureFormat}$`;
       const match = fileName.match(new RegExp(regexp));
       if (!match) return [];
       const frameNum = parseInt(match[1]!, 10);
-      if (Number.isNaN(frameNum) || frameNum < 0) return [];
+      if (!Number.isSafeInteger(frameNum)) return [];
       return [{ fileName, frameNum }];
     });
 
     console.log('Renaming temp files...');
     const outPaths = await pMap(matches, async ({ fileName, frameNum }) => {
-      const duration = formatTimecode({ seconds: fromTime + (frameNum / fps), fileNameFriendly: true });
+      const duration = formatTimecode({ seconds: fromTime + frameNum / 1000000, fileNameFriendly: true });
       const renameFromPath = getOutPath({ customOutDir, filePath, fileName });
       const renameToPath = getOutPath({ customOutDir, filePath, fileName: getSuffixedFileName(filePath, getSuffix(duration)) });
       await fsOperationWithRetry(async () => rename(renameFromPath, renameToPath));

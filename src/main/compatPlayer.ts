@@ -2,6 +2,7 @@ import { ExecaError } from 'execa';
 
 import logger from './logger.js';
 import { createMediaSourceProcess } from './ffmpeg.js';
+import { createChunkReader } from './readableChunks.js';
 
 
 // eslint-disable-next-line import/prefer-default-export
@@ -11,18 +12,21 @@ export function createMediaSourceStream(params: Parameters<typeof createMediaSou
   const abort = () => abortController.abort();
 
   async function attemptCreateProcess({ forceColorspace }: { forceColorspace?: boolean } = {}) {
+    abortController.signal.throwIfAborted();
     const { videoStreamIndex, audioStreams, seekTo } = params;
 
     logger.info('Starting preview process', { videoStreamIndex, audioStreams, seekTo });
     const process = createMediaSourceProcess({ ...params, forceColorspace });
 
-    // eslint-disable-next-line unicorn/prefer-add-event-listener
-    abortController.signal.onabort = () => {
+    const stop = () => {
       logger.info('Aborting preview process', { videoStreamIndex, audioStreams, seekTo });
       process.kill('SIGKILL');
     };
+    abortController.signal.addEventListener('abort', stop, { once: true });
+    process.then(() => abortController.signal.removeEventListener('abort', stop), () => abortController.signal.removeEventListener('abort', stop));
 
     const { stdout } = process;
+    const nextChunk = createChunkReader(stdout, process, () => process.kill('SIGKILL'));
 
     logger.info('Waiting for first chunk');
 
@@ -30,19 +34,15 @@ export function createMediaSourceStream(params: Parameters<typeof createMediaSou
     let firstChunk: Buffer | undefined;
 
     try {
-      await Promise.race([
-        new Promise<void>((resolve, reject) => {
-          stdout.once('data', (chunk) => {
-            stdout.pause();
-            firstChunk = chunk;
-            resolve();
-          });
+      firstChunk = await Promise.race([
+        nextChunk(),
+        new Promise<never>((_resolve, reject) => {
           timeout = setTimeout(() => {
             reject(new Error('Timeout waiting for media source process to start outputting data'));
           }, 10000);
         }),
-        process,
-      ]);
+      ]) ?? undefined;
+      if (firstChunk == null) throw new Error('Media source process produced no data');
     } catch (err) {
       process.kill('SIGKILL');
       throw err;
@@ -52,44 +52,15 @@ export function createMediaSourceStream(params: Parameters<typeof createMediaSou
 
     logger.info('First chunk received');
 
-    const readChunk = async () => new Promise<Buffer | null>((resolve, reject) => {
+    const readChunk = async () => {
       if (firstChunk) {
         logger.info('Client read first chunk');
-        resolve(firstChunk);
+        const chunk = firstChunk;
         firstChunk = undefined;
-        return;
+        return chunk;
       }
-
-      // eslint-disable-next-line no-shadow
-      let cleanup: () => void;
-
-      const onClose = () => {
-        cleanup();
-        resolve(null);
-      };
-
-      // poor man's backpressure handling: we only read one chunk at a time
-      const onData = (chunk: Buffer) => {
-        stdout.pause();
-        cleanup();
-        resolve(chunk);
-      };
-      const onError = (err: Error) => {
-        cleanup();
-        reject(err);
-      };
-      cleanup = () => {
-        stdout.off('data', onData);
-        stdout.off('error', onError);
-        stdout.off('close', onClose);
-      };
-
-      stdout.once('data', onData);
-      stdout.once('error', onError);
-      stdout.once('close', onClose);
-
-      stdout.resume();
-    });
+      return nextChunk();
+    };
 
     return readChunk;
   }

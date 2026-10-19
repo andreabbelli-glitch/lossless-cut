@@ -15,13 +15,21 @@ import { parseSrt, parseSrtToSegments } from './edlFormats';
 import { UnsupportedFileError, UserFacingError } from '../errors';
 import mainApi from './mainApi';
 import { parseFfprobeDuration } from '../../common/util';
+import { withFfOperation } from './util/ffmpegOperation';
+import { findDirectionalKeyframeTime } from './util/keyframes';
 
 const { ffmpeg } = window.require('@electron/remote').require('./index.js');
 
-const { renderWaveformPng, mapTimesToSegments, detectSceneChanges, captureFrames, captureFrameToFile, captureFrameToClipboard, getFfCommandLine, runFfmpegConcat, runFfmpegWithProgress, getDuration, abortFfmpegs, runFfmpeg, runFfprobe, getFfmpegPath, setCustomFfPath, checkFfExists } = ffmpeg;
+const { mapTimesToSegments, detectSceneChanges, captureFrames, captureFrameToFile, captureFrameToClipboard, getFfCommandLine, runFfmpegConcat, runFfmpegWithProgress, getDuration, abortFfmpegs, runFfmpeg, getFfmpegPath, setCustomFfPath, checkFfExists } = ffmpeg;
 
 
-export { renderWaveformPng, mapTimesToSegments, detectSceneChanges, captureFrames, captureFrameToFile, captureFrameToClipboard, getFfCommandLine, runFfmpegConcat, runFfmpegWithProgress, getDuration, abortFfmpegs, runFfmpeg, getFfmpegPath, setCustomFfPath };
+export { mapTimesToSegments, detectSceneChanges, captureFrames, captureFrameToFile, captureFrameToClipboard, getFfCommandLine, runFfmpegConcat, runFfmpegWithProgress, getDuration, abortFfmpegs, runFfmpeg, getFfmpegPath, setCustomFfPath };
+
+export async function renderWaveformPng({ signal, ...params }: Parameters<typeof ffmpeg.renderWaveformPng>[0] & { signal?: AbortSignal }) {
+  return withFfOperation(signal, ffmpeg, async (operationId) => ffmpeg.renderWaveformPng({ ...params, operationId }));
+}
+
+const runFfprobe = (args: readonly string[], options?: { logCli?: boolean, signal?: AbortSignal }) => withFfOperation(options?.signal, ffmpeg, async (operationId) => ffmpeg.runFfprobe(args, { ...(options?.logCli != null && { logCli: options.logCli }), operationId }));
 
 
 export class RefuseOverwriteError extends Error {
@@ -73,14 +81,15 @@ export interface Frame {
   keyframe: boolean
 }
 
-export async function readFrames({ filePath, from, to, streamIndex }: {
+export async function readFrames({ filePath, from, to, streamIndex, signal }: {
   filePath: string,
   from?: number | undefined,
   to?: number | undefined,
   streamIndex: number,
+  signal?: AbortSignal,
 }) {
   const intervalsArgs = from != null && to != null ? ['-read_intervals', `${from}%${to}`] : [];
-  const { stdout } = await runFfprobe(['-v', 'error', ...intervalsArgs, '-show_packets', '-select_streams', String(streamIndex), '-show_entries', 'packet=pts_time,flags', '-of', 'json', filePath], { logCli: false });
+  const { stdout } = await runFfprobe(['-v', 'error', ...intervalsArgs, '-show_packets', '-select_streams', String(streamIndex), '-show_entries', 'packet=pts_time,flags', '-of', 'json', filePath], { logCli: false, ...(signal != null && { signal }) });
   const createdAt = new Date();
   const packetsFiltered: Frame[] = (JSON.parse(new TextDecoder().decode(stdout)).packets as { flags: string, pts_time: string }[])
     .map((p) => ({
@@ -93,10 +102,16 @@ export async function readFrames({ filePath, from, to, streamIndex }: {
   return sortBy(packetsFiltered, 'time');
 }
 
-export async function readFramesAroundTime({ filePath, streamIndex, aroundTime, window }: { filePath: string, streamIndex: number, aroundTime: number, window: number }) {
+export async function readFramesAroundTime({ filePath, streamIndex, aroundTime, window, signal }: { filePath: string, streamIndex: number, aroundTime: number, window: number, signal?: AbortSignal }) {
   invariant(aroundTime != null);
   const { from, to } = getIntervalAroundTime(aroundTime, window);
-  return readFrames({ filePath, from, to, streamIndex });
+  return readFrames({ filePath, from, to, streamIndex, ...(signal != null && { signal }) });
+}
+
+export async function readAllKeyframes({ signal, ...params }: { filePath: string, from: number, to: number, streamIndex: number, signal: AbortSignal }) {
+  const times = await withFfOperation(signal, ffmpeg, async (operationId) => ffmpeg.readKeyframeTimes({ ...params, operationId }));
+  const createdAt = new Date();
+  return times.map((time) => ({ time, keyframe: true, createdAt }));
 }
 
 export async function readKeyframesAroundTime({ filePath, streamIndex, aroundTime, window }: { filePath: string, streamIndex: number, aroundTime: number, window: number }) {
@@ -193,11 +208,7 @@ export function getSafeCutTime(frames: Frame[], cutTime: number, nextMode: boole
 }
 
 export function findNearestKeyFrameTime({ frames, time, direction }: { frames: Frame[], time: number, direction: number }) {
-  const keyframes = frames.filter((f) => f.keyframe && (direction > 0 ? f.time >= time : f.time <= time));
-  if (keyframes.length === 0) return undefined;
-  const nearestKeyFrame = sortBy(keyframes, (keyframe) => (direction > 0 ? keyframe.time - time : time - keyframe.time))[0];
-  if (!nearestKeyFrame) return undefined;
-  return nearestKeyFrame.time;
+  return findDirectionalKeyframeTime(frames, time, direction);
 }
 
 export function tryMapChaptersToEdl(chapters: FFprobeChapter[]) {
@@ -374,7 +385,7 @@ async function renderThumbnail(filePath: string, timestamp: number, signal: Abor
     '-',
   ];
 
-  const { stdout } = await runFfmpeg(args, { cancelSignal: signal }, { logCli: false });
+  const { stdout } = await withFfOperation(signal, ffmpeg, async (operationId) => runFfmpeg(args, undefined, { logCli: false, operationId }));
 
   const blob = safeCreateBlob(stdout, { type: 'image/jpeg' });
   return URL.createObjectURL(blob);
@@ -430,7 +441,12 @@ export async function renderThumbnails({ filePath, from, duration, onThumbnail, 
   // console.log(thumbTimes);
 
   await pMap(thumbTimes, async (time) => {
+    signal.throwIfAborted();
     const url = await renderThumbnail(filePath, time, signal);
+    if (signal.aborted) {
+      URL.revokeObjectURL(url);
+      signal.throwIfAborted();
+    }
     onThumbnail({ time, url });
   }, { concurrency: 2 });
 }
