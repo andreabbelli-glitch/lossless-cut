@@ -1,14 +1,12 @@
-import i18n from 'i18next';
-
 import { getRealVideoStreams, getVideoTimebase } from './util/streams';
 
 import { readKeyframesAroundTime, findNextKeyframe, findKeyframeAtExactTime } from './ffmpeg';
 import type { FFprobeStream } from '../../common/ffprobe';
-import { UserFacingError } from '../errors';
+import type { LiteFFprobeStream } from './types';
 import { readFileSize } from './util';
 
 
-const mapVideoCodec = (codec: string) => ({ av1: 'libsvtav1' }[codec] ?? codec);
+const mapVideoCodec = (codec: string) => ({ av1: 'libsvtav1', h264: 'libx264', hevc: 'libx265' }[codec] ?? codec);
 
 export async function needsSmartCut({ path, desiredCutFrom, videoStream }: {
   path: string,
@@ -36,7 +34,7 @@ export async function needsSmartCut({ path, desiredCutFrom, videoStream }: {
     keyframes = await readKeyframes(60);
     nextKeyframe = findNextKeyframe(keyframes, desiredCutFrom);
   }
-  if (nextKeyframe == null) throw new UserFacingError(i18n.t('Cannot find any keyframe after the desired start cut point'));
+  if (nextKeyframe == null) return { losslessCutFrom: Infinity, segmentNeedsSmartCut: true };
 
   console.log('Smart cut from keyframe', { keyframe: nextKeyframe.time, desiredCutFrom });
 
@@ -50,7 +48,7 @@ export async function needsSmartCut({ path, desiredCutFrom, videoStream }: {
 export async function getCodecParams({ path, fileDuration, streams }: {
   path: string,
   fileDuration: number | undefined,
-  streams: Pick<FFprobeStream, 'has_b_frames' | 'time_base' | 'codec_type' | 'disposition' | 'index' | 'bit_rate' | 'codec_name'>[],
+  streams: LiteFFprobeStream[],
 }) {
   const videoStreams = getRealVideoStreams(streams);
   if (videoStreams.length > 1) throw new Error('Can only smart cut video with exactly one video stream');

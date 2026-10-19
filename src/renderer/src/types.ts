@@ -142,7 +142,7 @@ export type CopyfileStreams = {
 
 export interface Chapter { start: number, end: number, name?: string | undefined }
 
-export type LiteFFprobeStream = Pick<FFprobeStream, 'index' | 'codec_type' | 'codec_tag' | 'codec_name' | 'disposition' | 'tags' | 'sample_rate' | 'time_base' | 'has_b_frames'>;
+export type LiteFFprobeStream = Pick<FFprobeStream, 'index' | 'codec_type' | 'codec_tag' | 'codec_name' | 'disposition' | 'tags' | 'sample_rate' | 'time_base' | 'has_b_frames'> & Partial<Pick<FFprobeStream, 'bit_rate' | 'pix_fmt' | 'profile' | 'color_range' | 'color_space' | 'color_transfer' | 'color_primaries' | 'codec_tag_string'>>;
 
 export interface FileStats {
   size: number | bigint,

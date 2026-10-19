@@ -1,6 +1,7 @@
+/* eslint-disable import/no-extraneous-dependencies */
 import { expect, test } from 'vitest';
 
-import { escapeFfmetadata, getProcessStderr, isExpectedAttachmentExit, serializeDispositions } from './exportMetadata';
+import { escapeFfmetadata, getMergedProvenanceMetadataArgs, getProvenanceMetadataArgs, getProcessStderr, isExpectedAttachmentExit, serializeDispositions } from './exportMetadata.js';
 
 test('chapter escaping preserves special characters and CRLF as one escaped newline', () => {
   expect(escapeFfmetadata('A\\B=#;\r\nC')).toBe('A\\\\B\\=\\#\\;\\\nC');
@@ -14,14 +15,29 @@ test('dispositions retain every active flag and explicitly clear an empty set', 
 
 test('attachment diagnostic works for text and buffered process stderr', () => {
   const message = 'At least one output file must be specified';
-  expect(getProcessStderr(new TextEncoder().encode(message))).toBe(message);
+  expect(getProcessStderr(Uint8Array.from(Array.from(message, (character) => character.codePointAt(0)!)))).toBe(message);
   expect(getProcessStderr(message)).toBe(message);
   expect(getProcessStderr(undefined)).toBe('');
 });
 
 test('attachment extraction does not hide another error or a different exit code', () => {
   const expected = 'At least one output file must be specified';
-  expect(isExpectedAttachmentExit(1, new TextEncoder().encode(`${expected}\r\n`))).toBe(true);
+  expect(isExpectedAttachmentExit(1, Uint8Array.from(Array.from(`${expected}\r\n`, (character) => character.codePointAt(0)!)))).toBe(true);
   expect(isExpectedAttachmentExit(1, `Permission denied\n${expected}`)).toBe(false);
   expect(isExpectedAttachmentExit(2, expected)).toBe(false);
+});
+
+test('compression provenance keeps the original comment and restores its UUID/profile fallback', () => {
+  const marker = JSON.stringify({ id: '12345678-1234-1234-1234-123456789abc', profile: 'hevc-main10-crf26-slow-v1', version: 1, generation: 1 });
+  const args = getProvenanceMetadataArgs({ STASH_COMPRESSION: marker, COMMENT: 'Original comment' });
+  expect(args).toEqual(['-metadata', `stash_compression=${marker}`, '-metadata', 'comment=Original comment\nSTASH-COMPRESSION:v1:12345678-1234-1234-1234-123456789abc:hevc-main10-crf26-slow-v1']);
+  expect(getProvenanceMetadataArgs({ comment: 'Ordinary unmarked file' })).toEqual([]);
+});
+
+test('merging marked inputs retains every source identity in the comment fallback', () => {
+  const profile = 'hevc-main10-crf26-slow-v1';
+  const ids = ['12345678-1234-1234-1234-123456789abc', '87654321-4321-4321-4321-cba987654321'];
+  const args = getMergedProvenanceMetadataArgs(ids.map((id) => ({ stash_compression: JSON.stringify({ id, profile, version: 1, generation: 1 }) })));
+  expect(args.filter((value) => value.startsWith('stash_compression='))).toHaveLength(1);
+  expect(args.at(-1)).toBe(`comment=STASH-COMPRESSION:v1:${ids[0]}:${profile}\nSTASH-COMPRESSION:v1:${ids[1]}:${profile}`);
 });
