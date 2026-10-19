@@ -8,6 +8,7 @@ import type { RequestMessageData, ResponseMessageData } from './eval';
 // `this` doesn't seem to work when transpiling, so use globalThis instead
 // https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/globalThis
 const myGlobal = globalThis;
+const executionClock = globalThis.performance;
 
 
 const wl = {
@@ -131,15 +132,17 @@ myGlobal.fetch = undefined;
     'use strict';
 
     const { code, id, context: contextStr } = event.data;
-    const context = { ...JSON.parse(contextStr) };
+    const startedAt = executionClock.now();
+    postMessage({ id, startedAt: executionClock.timeOrigin + startedAt } satisfies ResponseMessageData);
 
     try {
+      const context = { ...JSON.parse(contextStr) };
       // https://stackoverflow.com/questions/8403108/calling-eval-in-particular-context
       // eslint-disable-next-line unicorn/new-for-builtins, no-new-func
       const result = Function(`\nwith (this) { return (${code}); }`).call(context);
-      postMessage({ id, data: result } satisfies ResponseMessageData);
+      postMessage({ id, durationMs: executionClock.now() - startedAt, data: result } satisfies ResponseMessageData);
     } catch (e) {
-      postMessage({ id, error: `${e}` } satisfies ResponseMessageData);
+      postMessage({ id, durationMs: executionClock.now() - startedAt, error: `${e}` } satisfies ResponseMessageData);
     }
   };
 })();
