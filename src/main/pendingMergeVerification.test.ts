@@ -15,6 +15,8 @@ const { verifyExport } = await import('./exportVerification');
 let directory: string;
 let source: string;
 let merged: string;
+let repeatedSource: string;
+let repeatedPart: string;
 const parts: string[] = [];
 
 beforeAll(async () => {
@@ -35,6 +37,13 @@ beforeAll(async () => {
   const list = join(directory, 'parts.txt');
   await writeFile(list, parts.map((path, index) => `file '${path.replaceAll('\\', '/')}'\nduration ${plan.segments[index]!.duration}`).join('\n'));
   await ffmpeg.runFfmpeg(['-v', 'error', '-copyts', '-f', 'concat', '-safe', '0', '-i', list, '-map', '0', '-c', 'copy', '-movie_timescale', String(plan.segments[0]!.movieTimescale), merged]);
+  repeatedSource = join(directory, 'repeated-source.mp4');
+  repeatedPart = join(directory, 'repeated-part.mp4');
+  await ffmpeg.runFfmpeg(['-v', 'error', '-f', 'lavfi', '-i', 'testsrc2=s=192x108:r=25:d=24', '-f', 'lavfi', '-i', 'sine=r=48000:d=24', '-c:v', 'libx265', '-pix_fmt', 'yuv420p10le', '-crf', '26', '-preset', 'slow', '-x265-params', 'open-gop=0:pools=1:frame-threads=1:keyint=50:min-keyint=50:scenecut=0:log-level=error', '-tag:v', 'hvc1', '-c:a', 'aac', repeatedSource]);
+  const repeatedPlan = await planCompatibleCuts({ path: repeatedSource, segments: [{ start: 0, end: 8 }], streamIds: [0, 1] });
+  expect(repeatedPlan.possible).toBe(true);
+  const timing = getCompatibleTimingArgs(repeatedPlan.segments[0]!);
+  await ffmpeg.runFfmpeg([...timing.beforeInput, '-i', repeatedSource, ...timing.afterInput, '-map', '0', '-c', 'copy', ...timing.filters.flatMap((filter) => [`-bsf:${filter.streamIndex}`, filter.expression]), repeatedPart]);
 }, 30000);
 
 afterAll(async () => {
@@ -55,6 +64,14 @@ test('copied AAC decoder reset remains strict for separate files and explicitly 
 test('deferring AAC content cannot hide a video selection error', async () => {
   const result = await verifyExport({ id: 'pending-wrong-video-range', path: source, sources: [{ path: source, start: 8, end: 16, streamIds: [0, 1] }], merged: false, deferAudioContentToMerge: true });
   expect(result, JSON.stringify(result)).toMatchObject({ status: 'failed' });
+}, 30000);
+
+test('AAC payload repeated after the selected end cannot invent a different common shift', async () => {
+  const options = { path: repeatedPart, sources: [{ path: repeatedSource, start: 0, end: 8, streamIds: [0, 1] }], merged: false };
+  const strict = await verifyExport({ ...options, id: 'repeated-aac-strict' });
+  expect(strict, JSON.stringify(strict)).toMatchObject({ status: 'passed' });
+  const pending = await verifyExport({ ...options, id: 'repeated-aac-pending', deferAudioContentToMerge: true });
+  expect(pending, JSON.stringify(pending)).toMatchObject({ status: 'pending-merge', coverage: { boundaries: false } });
 }, 30000);
 
 test('the final merge proves original PCM and cannot request intermediate deferral', async () => {

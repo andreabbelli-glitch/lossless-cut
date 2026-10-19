@@ -580,6 +580,11 @@ async function verify(params: VerifyExportParams, job: Job): Promise<ExportVerif
         if (sourceStream == null || !['video', 'audio'].includes(sourceStream.codec_type)) continue;
         if (params.reencodedVideo && !params.merged && sourceStream.codec_type === 'video') continue;
         if (sourceStream.codec_type === 'audio' && reencodedAudio.has(mapping.get(packet.stream)!)) continue;
+        // Probing retains decoder context after a selection. Those packets must
+        // not vote on its shift: repeated AAC payload can also occur inside it.
+        // Video dependencies use DTS; shown frames still have a separate PTS guard.
+        const clock = sourceStream.codec_type === 'video' ? packet.dts : packet.pts;
+        if (source.end != null && clock * ratio(sourceStream.time_base) >= (finite(meta.format.start_time) || 0) + source.end) continue;
         anchors.push({ packet, sourceIndex, sourceStream, outputIndex: mapping.get(packet.stream)!, matches: [] });
       }
     }
