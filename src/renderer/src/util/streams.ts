@@ -1,4 +1,5 @@
 import invariant from 'tiny-invariant';
+import { serializeDispositions } from '../../../common/exportMetadata';
 import type { FFprobeStream, FFprobeStreamDisposition } from '../../../common/ffprobe';
 import type { AvoidNegativeTs } from '../../../common/types';
 import type { AllFilesMeta, BsfAspectRatioParams, BsfCropParams, ChromiumHTMLAudioElement, ChromiumHTMLVideoElement, CopyfileStreams, FileParams, LiteFFprobeStream, StreamParams } from '../types';
@@ -203,10 +204,7 @@ function getPerStreamFlags({ stream, outputIndex, outFormat, manuallyCopyDisposi
 
   // when concat'ing, disposition doesn't seem to get automatically transferred by ffmpeg, so we must do it manually
   if (manuallyCopyDisposition && stream.disposition != null) {
-    const activeDisposition = getActiveDisposition(stream.disposition);
-    if (activeDisposition != null) {
-      addArgs(`-disposition:${outputIndex}`, String(activeDisposition));
-    }
+    addArgs(`-disposition:${outputIndex}`, serializeDispositions(stream.disposition));
   }
 
   args = [...args];

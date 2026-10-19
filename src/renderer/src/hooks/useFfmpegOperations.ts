@@ -17,6 +17,7 @@ import { UserFacingError } from '../../errors';
 import mainApi from '../mainApi';
 import { formatFfmpegNumber, getFixChannelLayoutFilter, getHwaccelArgs, hasCustomChannelLayout } from '../../../common/util';
 import { join, resolve, dirname } from '../util/path';
+import { escapeFfmetadata, isExpectedAttachmentExit } from '../../../common/exportMetadata';
 
 const { writeFile, mkdir, access, constants: { W_OK } } = window.require('node:fs/promises');
 
@@ -34,7 +35,7 @@ async function writeChaptersFfmetadata(outDir: string, chapters: Chapter[] | und
   const path = join(outDir, `ffmetadata-${Date.now()}.txt`);
 
   const ffmetadata = chapters.map(({ start, end, name }) => (
-    `[CHAPTER]\nTIMEBASE=1/1000\nSTART=${Math.floor(start * 1000)}\nEND=${Math.floor(end * 1000)}\ntitle=${name || ''}`
+    `[CHAPTER]\nTIMEBASE=1/1000\nSTART=${Math.floor(start * 1000)}\nEND=${Math.floor(end * 1000)}\ntitle=${escapeFfmetadata(name || '')}`
   )).join('\n\n');
   console.log('Writing chapters', ffmetadata);
   await writeFile(path, ffmetadata);
@@ -632,7 +633,7 @@ function useFfmpegOperations({ filePath, treatInputFileModifiedTimeAsStart, trea
         // simple lossless cut
         invariant(outFormat != null);
         await losslessCutSingle({
-          cutFrom: desiredCutFrom, cutTo, chaptersPath, outPath: finalOutPath, copyFileStreams, keyframeCut, avoidNegativeTs, fileDuration, rotation, allFilesMeta, outFormat, shortestFlag, ffmpegExperimental, preserveMetadata, preserveMovData, preserveChapters, movFastStart, paramsByFile, onProgress: (progress) => onSingleProgress(i, progress),
+          cutFrom: desiredCutFrom, cutTo, chaptersPath, outPath: finalOutPath, copyFileStreams, keyframeCut, avoidNegativeTs, fileDuration, rotation, allFilesMeta, outFormat, shortestFlag, ffmpegExperimental, preserveMetadata, preserveMovData, preserveChapters, movFastStart, paramsByFile, detectedFps, onProgress: (progress) => onSingleProgress(i, progress),
         });
         return { path: finalOutPath, created: true };
       }
@@ -708,7 +709,7 @@ function useFfmpegOperations({ filePath, treatInputFileModifiedTimeAsStart, trea
 
       // for smart cut we need to use keyframe cut here, and no avoid_negative_ts
       await losslessCutSingle({
-        cutFrom: losslessCutFrom, cutTo, chaptersPath, outPath: losslessPartOutPath, copyFileStreams: copyFileStreamsFiltered, keyframeCut: true, avoidNegativeTs: undefined, fileDuration, rotation, allFilesMeta, outFormat, shortestFlag, ffmpegExperimental, preserveMetadata, preserveMovData, preserveChapters, movFastStart, paramsByFile, videoTimebase, onProgress,
+        cutFrom: losslessCutFrom, cutTo, chaptersPath, outPath: losslessPartOutPath, copyFileStreams: copyFileStreamsFiltered, keyframeCut: true, avoidNegativeTs: undefined, fileDuration, rotation, allFilesMeta, outFormat, shortestFlag, ffmpegExperimental, preserveMetadata, preserveMovData, preserveChapters, movFastStart, paramsByFile, videoTimebase, detectedFps, onProgress,
       });
 
       // We don't need to concat, just return the single cut file (we may need smart cut in other segments though)
@@ -1125,7 +1126,7 @@ function useFfmpegOperations({ filePath, treatInputFileModifiedTimeAsStart, trea
     } catch (err) {
       // Unfortunately ffmpeg will exit with code 1 even though it's a success
       // Note: This is kind of hacky:
-      if (err instanceof Error && 'exitCode' in err && 'stderr' in err && err.exitCode === 1 && typeof err.stderr === 'string' && err.stderr.includes('At least one output file must be specified')) return outPaths;
+      if (err instanceof Error && 'exitCode' in err && 'stderr' in err && isExpectedAttachmentExit(err.exitCode, err.stderr) && (await Promise.all(outPaths.map((path) => mainApi.pathExists(path)))).every(Boolean)) return outPaths;
       throw err;
     }
     return outPaths;

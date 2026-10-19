@@ -115,18 +115,30 @@ test('getMapStreamsArgs, smart cut', () => {
   })).toEqual([
     '-map', '0:1',
     '-c:0', 'copy',
+    '-disposition:0', '0',
     '-map', '0:2',
     '-c:1', 'h264',
     '-b:1', '123456789',
+    '-disposition:1', '0',
     '-map', '0:4',
     '-c:2', 'copy',
+    '-disposition:2', '0',
     '-map', '0:5',
     '-c:3', 'copy',
+    '-disposition:3', '0',
     '-map', '0:6',
     '-c:4', 'copy',
+    '-disposition:4', '0',
     '-map', '0:7',
     '-c:5', 'mov_text',
+    '-disposition:5', '0',
   ]);
+});
+
+test('merge preserves combined subtitle dispositions', () => {
+  const streams: LiteFFprobeStream[] = [{ ...streams1[7]!, disposition: makeDisposition({ default: 1, forced: 1, hearing_impaired: 1 }) }];
+  expect(getMapStreamsArgs({ allFilesMeta: { [path]: { streams } }, copyFileStreams: [{ path, streamIds: [7] }], outFormat: 'matroska', manuallyCopyDisposition: true }))
+    .toContain('default+forced+hearing_impaired');
 });
 
 test('getStreamIdsToCopy, includeAllStreams false', () => {
