@@ -39,6 +39,11 @@ import './i18n.js';
 import type { ApiActionRequest, Config } from '../common/types.js';
 import * as ffmpeg from './ffmpeg.js';
 import * as compatPlayer from './compatPlayer.js';
+import * as outputTransactions from './outputTransaction.js';
+import { verifyExport, getExportVerificationState, cancelExportVerification } from './exportVerification.js';
+import { planCompatibleCuts, planVideoCopyRange, checkCompatibleSource } from './compatibleCuts.js';
+import { checkOutputPathIdentity } from './outputPathIdentity.js';
+import { restoreWindowBounds } from './windowBounds.js';
 import { downloadMediaUrl } from './ffmpeg.js';
 import { hasDisabledNetworking, setDisableNetworking } from './networking.js';
 
@@ -104,6 +109,7 @@ async function sendApiAction(action: string, args?: unknown[]) {
 export type AppEvent = {
   eventName: 'export-complete',
   paths?: string[],
+  status?: 'created' | 'skipped' | 'failed' | 'cancelled',
 } | {
   eventName: 'export-start',
   path: string,
@@ -134,25 +140,7 @@ async function onAwaitAppEvent(awaitEventName: string, signal: AbortSignal) {
 // https://github.com/electron/electron/issues/526#issuecomment-563010533
 function getSavedBounds() {
   const bounds = configStore.get('windowBounds');
-  const options: BrowserWindowConstructorOptions = {};
-  if (bounds) {
-    const area = electron.screen.getDisplayMatching(bounds).workArea;
-    // If the saved position still valid (the window is entirely inside the display area), use it.
-    if (
-      bounds.x >= area.x
-      && bounds.y >= area.y
-      && bounds.x + bounds.width <= area.x + area.width
-      && bounds.y + bounds.height <= area.y + area.height
-    ) {
-      options.x = bounds.x;
-      options.y = bounds.y;
-    }
-    // If the saved size is still valid, use it.
-    if (bounds.width <= area.width || bounds.height <= area.height) {
-      options.width = bounds.width;
-      options.height = bounds.height;
-    }
-  }
+  const options: BrowserWindowConstructorOptions = restoreWindowBounds(bounds, electron.screen.getAllDisplays().map((display) => display.workArea));
   return {
     options,
     isMaximized: bounds != null ? bounds.isMaximized : false,
@@ -471,6 +459,14 @@ function sendOsNotification(options: NotificationConstructorOptions) {
 }
 
 const remoteApi = {
+  ...outputTransactions,
+  verifyExport,
+  getExportVerificationState,
+  cancelExportVerification,
+  planCompatibleCuts,
+  planVideoCopyRange,
+  checkCompatibleSource,
+  checkOutputPathIdentity,
   pathExists,
   downloadMediaUrl,
   fileTypeFromFile,

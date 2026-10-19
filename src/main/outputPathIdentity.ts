@@ -48,7 +48,8 @@ export function getFuturePathKey(directoryIdentity: string, names: string[], sem
 }
 
 async function namesAlias(directory: string, first: string[], second: string[], semantics: DirectorySemantics) {
-  if (first.every((name) => /^[\x00-\x7F]*$/.test(name)) && second.every((name) => /^[\x00-\x7F]*$/.test(name))) return true;
+  const ascii = (name: string) => [...name].every((character) => character.codePointAt(0)! < 128);
+  if (first.every((name) => ascii(name)) && second.every((name) => ascii(name))) return true;
   const scratch = await mkdtemp(join(directory, '.losslesscut-identity-'));
   try {
     // Per-directory case flags need not be inherited on every filesystem.
