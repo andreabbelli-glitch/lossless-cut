@@ -3,7 +3,7 @@
   "productName": "LosslessCut",
   "description": "The swiss army knife of lossless video/audio editing",
   "copyright": "Copyright © 2026 ${author}",
-  "version": "3.70.1",
+  "version": "3.70.0",
   "main": "./out/main/index.js",
   "homepage": "./",
   "type": "module",
@@ -181,7 +181,6 @@
       "onlyLoadAppFromAsar": true
     },
     "appId": "no.mifi.losslesscut",
-    "afterPack": "./script/afterPack.ts",
     "artifactName": "${productName}-${os}-${arch}.${ext}",
     "extraResources": [
       {
