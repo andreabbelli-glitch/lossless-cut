@@ -22,8 +22,14 @@ const onClock = (time: Rational, clock: Rational) => {
   return numerator % denominator === 0n ? numerator / denominator : undefined;
 };
 const atTick = (tick: bigint, clock: Rational) => rational(tick * clock.n, clock.d);
+const probeTime = (timestamp: Rational) => {
+  const scaled = timestamp.n * 1000000n;
+  const microseconds = scaled / timestamp.d + (scaled % timestamp.d > 0n ? 1n : 0n);
+  const magnitude = microseconds < 0n ? -microseconds : microseconds;
+  return `${microseconds < 0n ? '-' : ''}${magnitude / 1000000n}.${String(magnitude % 1000000n).padStart(6, '0')}`;
+};
 
-interface SourceStream { index: number, codec_type: string, codec_name?: string, time_base: string, sample_rate?: string, extradata?: string }
+interface SourceStream { index: number, codec_type: string, codec_name?: string, time_base: string, sample_rate?: string, extradata?: string, start_time?: string, duration?: string }
 interface Packet { pts: bigint, dts: bigint, duration: bigint, keyframe: boolean, skip: bigint, discard: bigint }
 interface Point { time: Rational, videoPts: bigint, videoDts: bigint | undefined, audio: Map<number, bigint>, eof: boolean }
 async function packets(path: string, streamIndex: number, operationId: string | undefined, visit: (packet: Packet) => void) {
@@ -34,7 +40,7 @@ async function packets(path: string, streamIndex: number, operationId: string | 
     for await (const line of lines) {
       const fields = Object.fromEntries(line.split('|').map((field) => field.split('=')));
       if (fields['pts'] != null && /^-?\d+$/.test(fields['pts']) && fields['dts'] != null && /^-?\d+$/.test(fields['dts']) && fields['duration'] != null && /^\d+$/.test(fields['duration'])) {
-        visit({ pts: BigInt(fields['pts']), dts: BigInt(fields['dts']), duration: BigInt(fields['duration']), keyframe: fields['flags']?.startsWith('K') ?? false, skip: BigInt(fields['skip_samples'] ?? '0'), discard: BigInt(fields['discard_padding'] ?? '0') });
+        visit({ pts: BigInt(fields['pts']), dts: BigInt(fields['dts']), duration: BigInt(fields['duration']), keyframe: fields['flags']?.startsWith('K') ?? false, skip: BigInt(fields['side_datum/skip_samples:skip_samples'] ?? '0'), discard: BigInt(fields['side_datum/skip_samples:discard_padding'] ?? '0') });
       }
     }
     await ps;
@@ -55,7 +61,8 @@ function dumpBytes(dump: string) {
   return Buffer.from(hex, 'hex');
 }
 
-// A keyframe flag alone does not prove a closed GOP (HEVC CRA can have RASL).
+// A keyframe flag alone does not prove a closed GOP. Accept only the HEVC
+// no-leading-picture IRAP variants; CRA and *_W_RADL / *_W_LP need more proof.
 // Inspect the first VCL NAL of each actually proposed boundary.
 export function isClosedRandomAccess(packet: Uint8Array, codec: string, lengthSize: number) {
   let offset = 0;
@@ -65,7 +72,7 @@ export function isClosedRandomAccess(packet: Uint8Array, codec: string, lengthSi
     offset += lengthSize;
     if (length <= 0 || offset + length > packet.length) return false;
     const type = codec === 'hevc' ? Math.floor(packet[offset]! / 2) % 64 : packet[offset]! % 32;
-    if (codec === 'hevc' && type <= 31) return type >= 16 && type <= 20;
+    if (codec === 'hevc' && type <= 31) return type === 18 || type === 20;
     if (codec === 'h264' && type >= 1 && type <= 5) return type === 5;
     offset += length;
   }
@@ -79,8 +86,7 @@ async function proveClosedPoint(path: string, video: SourceStream, clock: Ration
   const timestamp = atTick(point.videoPts, clock);
   // FFmpeg CLI time syntax has a microsecond clock. Round upward on that
   // clock, rather than guessing an FPS-dependent seek epsilon.
-  const microseconds = (timestamp.n * 1000000n + timestamp.d - 1n) / timestamp.d;
-  const { stdout } = await runFfprobe(['-v', 'error', '-select_streams', String(video.index), '-read_intervals', `${Number(microseconds) / 1000000}%+#1`, '-show_packets', '-show_data', '-show_entries', 'packet=pts,data', '-of', 'json', path], { logCli: false, operationId });
+  const { stdout } = await runFfprobe(['-v', 'error', '-select_streams', String(video.index), '-read_intervals', `${probeTime(timestamp)}%+#1`, '-show_packets', '-show_data', '-show_entries', 'packet=pts,data', '-of', 'json', path], { logCli: false, operationId });
   const data = JSON.parse(Buffer.from(stdout).toString()) as { packets: { pts: number, data: string }[] };
   const packet = data.packets[0];
   return packet != null && BigInt(packet.pts) === point.videoPts && isClosedRandomAccess(dumpBytes(packet.data), video.codec_name!, lengthSize);
@@ -175,7 +181,7 @@ export async function planCompatibleCuts({ path, segments, streamIds, operationI
         }
       }
       const matches = targets.get(String(packet.pts)) ?? [];
-      if (previousEnd === packet.pts) matches.forEach((point) => point.audio.set(stream.index, packet.pts));
+      if (previousEnd === packet.pts) matches.forEach((point) => { if (point.time.n !== 0n) point.audio.set(stream.index, packet.pts); });
       previousEnd = packet.pts + packet.duration;
       audioEnd = subtract(atTick(previousEnd, clock), rational(packet.discard, BigInt(stream.sample_rate!)));
     });
@@ -218,4 +224,63 @@ export async function checkCompatibleSource({ path, sourceIdentity }: { path: st
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
     throw error;
   }
+}
+
+// Smart Cut already knows its candidate keyframes. Prove just those two points;
+// the full alternative-boundary planner is reserved for exceptional export review.
+export async function planVideoCopyRange({ path, streamIndex, range, toEnd = false, operationId }: { path: string, streamIndex: number, range: Range, toEnd?: boolean | undefined, operationId?: string | undefined }): Promise<CompatibleCutPlan> {
+  const failed = (issue: string): CompatibleCutPlan => ({ possible: false, issues: [issue], segments: [] });
+  if (!Number.isFinite(range.start) || !Number.isFinite(range.end) || range.start < 0 || range.end <= range.start) return failed('A video copy range must have finite ordered boundaries.');
+  const identity = await stat(path);
+  const { stdout } = await runFfprobe(['-v', 'error', '-select_streams', String(streamIndex), '-read_intervals', '%+#1', '-show_streams', '-show_packets', '-show_data', '-show_entries', 'stream=index,codec_type,codec_name,time_base,extradata,start_time,duration:packet=pts', '-of', 'json', path], { logCli: false, operationId });
+  const metadata = JSON.parse(Buffer.from(stdout).toString()) as { streams: SourceStream[], packets: { pts: number }[] };
+  const video = metadata.streams[0];
+  if (video?.codec_type !== 'video' || !['h264', 'hevc'].includes(video.codec_name ?? '')) return failed('The video copy proof requires one AVC/HEVC track.');
+  const clock = parseClock(video.time_base);
+  if (clock.d > 2147483647n) return failed('The video packet clock cannot be represented by the MP4 movie clock.');
+  const extra = dumpBytes(video.extradata ?? '');
+  if (extra[0] !== 1) return failed('The video copy proof requires length-prefixed AVC/HEVC.');
+  const lengthSize = ((extra[video.codec_name === 'hevc' ? 21 : 4] ?? 0) % 4) + 1;
+  const firstPts = metadata.packets[0]?.pts;
+  if (!Number.isSafeInteger(firstPts)) return failed('The first video presentation timestamp is incomplete.');
+  const origin = BigInt(firstPts!);
+  const toTick = (time: number) => BigInt(Math.round(time / seconds(clock)));
+  const startTick = origin + toTick(range.start);
+  let endTick = origin + toTick(range.end);
+  if (toEnd) {
+    const trackEnd = Number(video.start_time) + Number(video.duration);
+    if (!Number.isFinite(trackEnd) || !(Number(video.duration) > 0)) return failed('The video presentation end is incomplete.');
+    const sourceEndTick = toTick(trackEnd);
+    if (sourceEndTick !== endTick) return failed('The requested video copy range does not end at the source presentation end.');
+    endTick = sourceEndTick;
+  }
+  const prove = async (pts: bigint) => {
+    const timestamp = atTick(pts, clock);
+    const result = await runFfprobe(['-v', 'error', '-select_streams', String(streamIndex), '-read_intervals', `${probeTime(timestamp)}%+#1`, '-show_packets', '-show_data', '-show_entries', 'packet=pts,dts,data', '-of', 'json', path], { logCli: false, operationId });
+    const packet = (JSON.parse(Buffer.from(result.stdout).toString()) as { packets: { pts: number, dts: number, data: string }[] }).packets[0];
+    if (packet == null || !Number.isSafeInteger(packet.pts) || !Number.isSafeInteger(packet.dts) || BigInt(packet.pts) !== pts || !isClosedRandomAccess(dumpBytes(packet.data), video.codec_name!, lengthSize)) return undefined;
+    return BigInt(packet.dts);
+  };
+  const startDts = await prove(startTick);
+  const endDts = toEnd ? undefined : await prove(endTick);
+  if (startDts == null || (!toEnd && (endDts == null || endDts <= startDts))) return failed('The exact video copy boundaries are not proven closed random-access points.');
+  const current = await stat(path);
+  if (identity.size !== current.size || identity.mtimeMs !== current.mtimeMs) return failed('The source changed during video copy boundary proof.');
+  const start = seconds(atTick(startTick - origin, clock));
+  const end = seconds(atTick(endTick - origin, clock));
+  const segment: CompatibleCut = {
+    requested: range,
+    start,
+    end,
+    duration: end - start,
+    includedBefore: Math.max(0, range.start - start),
+    includedAfter: Math.max(0, end - range.end),
+    excludedBefore: Math.max(0, start - range.start),
+    excludedAfter: Math.max(0, range.end - end),
+    seekFrom: seconds(atTick(startTick, clock)),
+    readTo: toEnd ? undefined : seconds(atTick(endTick, clock)),
+    movieTimescale: Number(clock.d),
+    filters: [{ streamIndex, expression: `noise=drop='lt(dts,${startDts})${toEnd ? '' : `+gte(dts,${endDts})`}'` }],
+  };
+  return { possible: true, issues: [], segments: [segment], sourceIdentity: { size: current.size, mtimeMs: current.mtimeMs } };
 }

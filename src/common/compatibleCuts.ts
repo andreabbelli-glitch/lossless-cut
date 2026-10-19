@@ -30,7 +30,7 @@ export type CompatibleCutPlan = {
 export function getCompatibleTimingArgs(segment: CompatibleCut) {
   return {
     beforeInput: ['-copyts', ...(segment.start > 0 ? ['-seek_timestamp', '1', '-ss', String(segment.seekFrom)] : [])],
-    afterInput: [...(segment.readTo != null ? ['-to', String(segment.readTo)] : []), '-avoid_negative_ts', 'disabled', '-output_ts_offset', String(-segment.start), '-movie_timescale', String(segment.movieTimescale)],
+    afterInput: [...(segment.readTo != null ? ['-to', String(segment.readTo)] : []), '-avoid_negative_ts', 'disabled', '-output_ts_offset', String(-segment.start), '-movie_timescale', String(segment.movieTimescale), '-movflags', '+negative_cts_offsets'],
     filters: segment.filters,
   };
 }
