@@ -22,9 +22,11 @@ export interface VerificationSource { path: string, start?: number, end?: number
 export interface VerifyExportParams {
   id: string, path: string, sources: VerificationSource[], merged: boolean, reencodedVideo?: boolean, timeScale?: number,
   expectedStreams?: Partial<VerificationStreamInfo>[], preserveTrackMetadata?: boolean,
+  reencodedAudioStreamIds?: number[],
+  deferAudioContentToMerge?: boolean,
 }
 export interface ExportVerificationResult {
-  status: 'passed' | 'failed' | 'inconclusive', issues: string[], elapsedMs: number,
+  status: 'passed' | 'failed' | 'inconclusive' | 'pending-merge', issues: string[], elapsedMs: number,
   cancelled?: boolean,
   coverage: { structure: boolean, packetTimestamps: boolean, boundaries: boolean, perceptualVideo: boolean },
 }
@@ -38,8 +40,8 @@ interface Packet {
   key: boolean,
 }
 interface Anchor { packet: Packet, sourceIndex: number, sourceStream: StreamInfo, outputIndex: number, matches: Packet[] }
-interface Frame { pts: number, duration: number, hash: string, samples?: Int16Array }
-interface DecodeWindow { path: string, stream: StreamInfo, from: number, to: number, origin?: number }
+interface Frame { pts: number, duration: number, hash: string, samples?: Int16Array | Int32Array }
+interface DecodeWindow { path: string, stream: StreamInfo, from: number, to: number, origin?: number, wholeAudioFrames?: boolean, samples32?: boolean }
 
 const jobs = new Map<string, Job>();
 let queue = Promise.resolve();
@@ -179,9 +181,7 @@ async function boundaryPackets(source: VerificationSource, metadata: Metadata, s
   for (const [intervalIndex, interval] of intervals.entries()) {
     let startKeyframeSeen = false;
     const cohorts = new Map<number, { first: Packet[], last: Packet[], recent: Packet[], atKey: Packet[], afterKey: number, nearest: { at: number, packets: Packet[] }[] }>();
-    const diagnostic = await consume(probe([
-      '-read_intervals', `${probeTime(Math.max(0, interval.from))}%${probeTime(interval.to)}`, ...packetArgs, source.path,
-    ], signal), (line) => {
+    const onPacket = (line: string) => {
       const packet = parsePacket(line);
       if (packet == null) return;
       visit?.(packet);
@@ -210,8 +210,21 @@ async function boundaryPackets(source: VerificationSource, metadata: Metadata, s
         nearest.packets.sort((a, b) => Math.abs(a.pts * tick - nearest.at) - Math.abs(b.pts * tick - nearest.at));
         if (nearest.packets.length > anchorLimit) nearest.packets.pop();
       }
-    }, signal);
-    if (diagnostic) throw new Error(diagnostic);
+    };
+    const readInterval = async (streamIndex?: number) => {
+      const diagnostic = await consume(probe([
+        ...(streamIndex == null ? [] : ['-select_streams', String(streamIndex)]),
+        '-read_intervals', `${probeTime(Math.max(0, interval.from))}%${probeTime(interval.to)}`, ...packetArgs, source.path,
+      ], signal), onPacket, signal);
+      if (diagnostic) throw new Error(diagnostic);
+    };
+    await readInterval();
+    // A fragmented MP4 can store one track's complete fragment before another's.
+    // FFprobe may stop on the first track before reaching the other track's earlier PTS.
+    // Supplement only missing tracks at this boundary, retaining the same bounded interval.
+    for (const [streamIndex, points] of targets) {
+      if (!cohorts.has(streamIndex) && points.some((at) => at >= interval.from && at <= interval.to)) await readInterval(streamIndex);
+    }
     cohorts.forEach((cohort) => packets.push(...(intervalIndex === 0 ? cohort.first : []), ...cohort.atKey, ...cohort.last, ...cohort.nearest.flatMap((nearest) => nearest.packets)));
   }
   return [...new Map(packets.map((packet) => [`${packet.stream}:${packet.pts}:${packet.hash}`, packet])).values()];
@@ -232,8 +245,8 @@ async function decode(window: DecodeWindow, signal: AbortSignal, perceptual = fa
     if (!line.startsWith('frame|')) return;
     const fields = splitFields(line);
     const pts = finite(fields['pts']) * tick;
-    if (pts < window.from - tick / 2 || pts >= window.to - tick / 2) return;
     const duration = video ? finite(fields['duration']) * tick : finite(fields['nb_samples']) / Number(window.stream.sample_rate);
+    if ((window.wholeAudioFrames ? pts + duration <= window.from : pts < window.from - tick / 2) || pts >= window.to - tick / 2) return;
     times.push({ pts, duration });
     if (times.length > decodedFrameLimit) throw new Error('Local verification window exceeds the bounded decoded-frame budget');
   }, signal);
@@ -244,23 +257,26 @@ async function decode(window: DecodeWindow, signal: AbortSignal, perceptual = fa
   const from = Math.min(...times.map((frame) => frame.pts));
   const to = Math.max(...times.map((frame) => frame.pts + frame.duration));
   const hashes: string[] = [];
-  const sampleBlocks: Int16Array[] = [];
+  const sampleBlocks: (Int16Array | Int32Array)[] = [];
+  const sampleBytes = window.samples32 ? 4 : 2;
   const audioContext = video ? 0 : 2048 / Number(window.stream.sample_rate);
   const child = spawnFfmpeg([
     '-v', 'error', '-nostdin', '-copyts', '-ss', String(Math.max(0, from - (window.origin ?? 0) - (video ? tick : audioContext))),
     ...(!video ? ['-noaccurate_seek'] : []), '-i', window.path,
     '-to', String(to + (video ? -tick / 2 : audioContext)), '-map', `0:${window.stream.index}`,
-    ...(video ? ['-c:v', 'rawvideo', '-threads:v', '1', '-fps_mode:v', 'passthrough', '-enc_time_base:v', 'demux'] : ['-c:a', 'pcm_s16le']),
+    ...(video ? ['-c:v', 'rawvideo', '-threads:v', '1', '-fps_mode:v', 'passthrough', '-enc_time_base:v', 'demux'] : ['-c:a', window.samples32 ? 'pcm_s32le' : 'pcm_s16le']),
     // CLI -ss is quantized to microseconds. Trim PCM in its integer sample clock,
     // otherwise a 2666.67 us boundary can silently remove one extra sample.
-    ...(!video ? ['-af', `atrim=start_pts=${Math.round(from / tick)}:end_pts=${Math.round(to / tick)}`, '-frames:a', String(times.length)] : []),
-    ...(!video ? ['-f', 's16le', '-'] : (perceptual ? ['-vf', 'scale=9:8:flags=area,format=gray', '-f', 'rawvideo', '-'] : ['-f', 'framehash', '-hash', 'sha256', '-'])),
+    ...(!video ? ['-af', window.wholeAudioFrames
+      ? `aselect='gte(t,${probeTime(from - tick / 2)})*lte(t,${probeTime(times.at(-1)!.pts + tick / 2)})'`
+      : `atrim=start_pts=${Math.round(from * Number(window.stream.sample_rate))}:end_pts=${Math.round(to * Number(window.stream.sample_rate))}`, '-frames:a', String(times.length)] : []),
+    ...(!video ? ['-f', window.samples32 ? 's32le' : 's16le', '-'] : (perceptual ? ['-vf', 'scale=9:8:flags=area,format=gray', '-f', 'rawvideo', '-'] : ['-f', 'framehash', '-hash', 'sha256', '-'])),
   ], { buffer: { stdout: false, stderr: false }, cancelSignal: signal }, { logCli: false });
   let hashDiagnostic: string;
   if (!video) {
     const expectedSamples = times.map((frame) => Math.round(frame.duration * Number(window.stream.sample_rate)) * (window.stream.channels ?? 1));
-    const expectedBytes = expectedSamples.reduce((sum, count) => sum + count, 0) * 2;
-    if (expectedBytes / 2 > decodedSampleLimit) { child.kill(); await child.catch(() => undefined); throw new Error('Local audio window exceeds the bounded sample budget'); }
+    const expectedBytes = expectedSamples.reduce((sum, count) => sum + count, 0) * sampleBytes;
+    if (expectedBytes / sampleBytes > decodedSampleLimit) { child.kill(); await child.catch(() => undefined); throw new Error('Local audio window exceeds the bounded sample budget'); }
     const completion = child.then(() => undefined, (error: unknown) => ({ error }));
     let tail = '';
     const drain = (async () => { for await (const chunk of child.stderr as Readable) tail = (tail + String(chunk)).slice(-diagnosticLimit); })();
@@ -279,11 +295,11 @@ async function decode(window: DecodeWindow, signal: AbortSignal, perceptual = fa
       const pcm = Buffer.concat(chunks);
       let offset = 0;
       for (const count of expectedSamples) {
-        const block = new Int16Array(count);
-        for (let index = 0; index < count; index += 1) block[index] = pcm.readInt16LE((offset + index) * 2);
+        const block = window.samples32 ? new Int32Array(count) : new Int16Array(count);
+        for (let index = 0; index < count; index += 1) block[index] = window.samples32 ? pcm.readInt32LE((offset + index) * sampleBytes) : pcm.readInt16LE((offset + index) * sampleBytes);
         offset += count;
         sampleBlocks.push(block);
-        hashes.push('pcm16');
+        hashes.push(window.samples32 ? 'pcm32' : 'pcm16');
       }
       hashDiagnostic = tail.trim();
     } catch (error) {
@@ -364,6 +380,56 @@ export function compareAudioSamples(reference: Frame[], actual: Frame[], shift: 
   return { complete: count > 0, equal: true, count };
 }
 
+async function compareConvertedAudio(reference: Frame[], actual: Frame[], shift: number, timeScale: number, source: StreamInfo, target: StreamInfo, signal: AbortSignal) {
+  const rate = Number(source.sample_rate);
+  const channels = source.channels ?? 1;
+  const quantum = ratio(source.time_base) + ratio(target.time_base) * timeScale + 1 / rate;
+  const sampleRadius = Math.ceil(quantum * rate);
+  const shifts: number[] = [];
+  let count = 0;
+  if (sampleRadius > decodedFrameLimit) return { complete: false, equal: false, shifts, count };
+  const matches = (frameIndex: number, offset: number, samples: Int16Array | Int32Array) => {
+    let current = frameIndex;
+    let at = offset;
+    for (const sample of samples) {
+      const block = reference[current]?.samples;
+      if (block == null || at < 0 || at >= block.length || sample !== block[at]) return false;
+      at += 1;
+      if (at === block.length) {
+        const previous = reference[current]!;
+        current += 1;
+        at = 0;
+        const next = reference[current];
+        if (next != null && Math.abs(next.pts - previous.pts - previous.duration) > ratio(source.time_base) + 1 / rate) return false;
+      }
+    }
+    return true;
+  };
+  for (const frame of actual) {
+    signal.throwIfAborted();
+    if (frame.samples == null || frame.samples.length !== Math.round(frame.duration * rate) * channels) return { complete: false, equal: false, shifts, count };
+    const wanted = (frame.pts - shift) * timeScale;
+    const candidates: number[] = [];
+    for (const [index, block] of reference.entries()) {
+      if (wanted < block.pts - quantum || wanted > block.pts + block.duration + quantum || block.samples == null) continue;
+      const predicted = Math.round((wanted - block.pts) * rate);
+      for (let sample = Math.max(0, predicted - sampleRadius); sample <= Math.min(block.samples.length / channels - 1, predicted + sampleRadius); sample += 1) {
+        if (matches(index, sample * channels, frame.samples)) {
+          candidates.push(frame.pts - (block.pts + sample / rate) / timeScale);
+          if (candidates.length > 1) return { complete: false, equal: false, shifts, count };
+        }
+      }
+    }
+    if (candidates.length === 0) return { complete: true, equal: false, shifts, count };
+    if (candidates.length > 1) return { complete: false, equal: false, shifts, count };
+    shifts.push(candidates[0]!);
+    count += frame.samples.length;
+    await yieldImmediate();
+    signal.throwIfAborted();
+  }
+  return { complete: count > 0, equal: true, shifts, count };
+}
+
 // Keep decode cohorts separate when a long GOP makes their timestamps far apart.
 function packetWindows(packets: Packet[], stream: StreamInfo, path: string, origin: number): DecodeWindow[] {
   const tick = ratio(stream.time_base);
@@ -424,6 +490,7 @@ async function verify(params: VerifyExportParams, job: Job): Promise<ExportVerif
   const issues: string[] = [];
   let failed = false;
   let inconclusive = false;
+  let deferredAudioContent = false;
   const coverage = { structure: false, packetTimestamps: false, boundaries: false, perceptualVideo: false };
   const fail = (message: string) => { failed = true; if (!issues.includes(message)) issues.push(message); };
   const doubt = (message: string) => { inconclusive = true; if (!issues.includes(message)) issues.push(message); };
@@ -432,6 +499,7 @@ async function verify(params: VerifyExportParams, job: Job): Promise<ExportVerif
   const timeScale = params.timeScale ?? 1;
   try {
     signal.throwIfAborted();
+    if (params.deferAudioContentToMerge && params.merged) throw new Error('Audio content deferral is not allowed on a final merged output');
     if (!Number.isFinite(timeScale) || timeScale <= 0) throw new Error('Invalid requested playback time scale');
     state.phase = 'structure';
     const initialIdentity = await stat(params.path, { bigint: true });
@@ -443,6 +511,10 @@ async function verify(params: VerifyExportParams, job: Job): Promise<ExportVerif
       return value;
     };
     const output = await metadata(params.path);
+    const reencodedAudio = new Set(params.reencodedAudioStreamIds ?? []);
+    for (const index of reencodedAudio) {
+      if (!Number.isInteger(index) || index < 0 || output.streams[index]?.codec_type !== 'audio') throw new Error('Declared audio conversion does not identify an output audio track');
+    }
     const sourceMetadata: Metadata[] = [];
     const sourceIdentities = new Map<string, Stats>();
     for (const source of params.sources) {
@@ -455,6 +527,7 @@ async function verify(params: VerifyExportParams, job: Job): Promise<ExportVerif
     }
     if (output.streams.length === 0 || params.sources.length === 0) throw new Error('No media tracks to verify');
     const anchors: Anchor[] = [];
+    const sourceMappings: Map<number, number>[] = [];
     const startKeyframes = new Map<string, Packet>();
     let nextOutputIndex = 0;
     for (let sourceIndex = 0; sourceIndex < params.sources.length; sourceIndex += 1) {
@@ -465,6 +538,7 @@ async function verify(params: VerifyExportParams, job: Job): Promise<ExportVerif
       if (params.merged && selected.length !== output.streams.length) fail('Merged track count differs from a selected source');
       const outputOffset = params.merged ? 0 : nextOutputIndex;
       const mapping = new Map(selected.map((stream, index) => [stream.index, outputOffset + index]));
+      sourceMappings.push(mapping);
       nextOutputIndex += selected.length;
       for (const stream of selected) {
         const targetIndex = mapping.get(stream.index)!;
@@ -505,6 +579,7 @@ async function verify(params: VerifyExportParams, job: Job): Promise<ExportVerif
         const sourceStream = selected.find((stream) => stream.index === packet.stream);
         if (sourceStream == null || !['video', 'audio'].includes(sourceStream.codec_type)) continue;
         if (params.reencodedVideo && !params.merged && sourceStream.codec_type === 'video') continue;
+        if (sourceStream.codec_type === 'audio' && reencodedAudio.has(mapping.get(packet.stream)!)) continue;
         anchors.push({ packet, sourceIndex, sourceStream, outputIndex: mapping.get(packet.stream)!, matches: [] });
       }
     }
@@ -612,6 +687,7 @@ async function verify(params: VerifyExportParams, job: Job): Promise<ExportVerif
       if (anchors.some((anchor) => anchor.matches.length > 1)) doubt('Repeated boundary packet content cannot be placed uniquely in the merge');
       for (const [index, edges] of outputEdges) {
         if (!['video', 'audio'].includes(streamByIndex.get(index)?.codec_type ?? '')) continue;
+        if (reencodedAudio.has(index)) continue;
         if (!(byHash.get(`${index}:${edges.first.hash}`) ?? []).some((anchor) => anchor.sourceIndex === 0)
           || !(byHash.get(`${index}:${edges.last.hash}`) ?? []).some((anchor) => anchor.sourceIndex === params.sources.length - 1)) fail('Actual merged output endpoints do not match the first and last selected parts');
       }
@@ -619,6 +695,7 @@ async function verify(params: VerifyExportParams, job: Job): Promise<ExportVerif
       for (const [index, edges] of outputEdges) {
         const target = output.streams.find((stream) => stream.index === index);
         if (target == null || !['video', 'audio'].includes(target.codec_type) || (params.reencodedVideo && target.codec_type === 'video')) continue;
+        if (reencodedAudio.has(index)) continue;
         const first = byHash.get(`${index}:${edges.first.hash}`) ?? [];
         const last = byHash.get(`${index}:${edges.last.hash}`) ?? [];
         if (first.length === 0 || last.length === 0) { fail(`Actual ${target.codec_type} output endpoints do not match the selected source boundaries`); continue; }
@@ -714,6 +791,7 @@ async function verify(params: VerifyExportParams, job: Job): Promise<ExportVerif
         decodedCache.clear();
         if (source.streamIds != null && !source.streamIds.includes(sourceStream.index)) continue;
         if (params.reencodedVideo && !params.merged && sourceStream.codec_type === 'video') continue;
+        if (sourceStream.codec_type === 'audio' && reencodedAudio.has(sourceMappings[sourceIndex]!.get(sourceStream.index)!)) continue;
         const matches = (byTrack.get(`${sourceIndex}:${sourceStream.index}`) ?? []).filter((anchor) => anchor.matches.length === 1);
         if (matches.length === 0) { doubt(`Cannot uniquely match ${sourceStream.codec_type} boundary content in segment ${sourceIndex + 1}`); continue; }
         const target = output.streams[matches[0]!.outputIndex];
@@ -724,7 +802,7 @@ async function verify(params: VerifyExportParams, job: Job): Promise<ExportVerif
         const shifts = matches.map((anchor) => anchor.matches[0]!.pts * outputTick - ((anchor.packet.pts * sourceTick) / timeScale));
         groups.push({ type: sourceStream.codec_type, shifts, quantum });
         for (const anchor of matches) {
-          if (params.merged && (anchor.packet.skip !== anchor.matches[0]!.skip || anchor.packet.discard !== anchor.matches[0]!.discard)) fail('Merge changed audio priming or discard samples on matching content');
+          if ((params.merged || (params.deferAudioContentToMerge && sourceStream.codec_name === 'aac')) && (anchor.packet.skip !== anchor.matches[0]!.skip || anchor.packet.discard !== anchor.matches[0]!.discard)) fail('Merge changed audio priming or discard samples on matching content');
           if (params.merged && Number.isFinite(anchor.packet.duration) && Math.abs(anchor.matches[0]!.duration * outputTick - ((anchor.packet.duration * sourceTick) / timeScale)) > sourceTick / timeScale + outputTick) fail(`Merge changed a ${sourceStream.codec_type} packet presentation duration`);
         }
         if (params.merged) {
@@ -734,6 +812,10 @@ async function verify(params: VerifyExportParams, job: Job): Promise<ExportVerif
             quantum,
             type: sourceStream.codec_type,
           });
+        }
+        if (params.deferAudioContentToMerge && sourceStream.codec_type === 'audio' && sourceStream.codec_name === 'aac' && target.codec_name === 'aac') {
+          deferredAudioContent = true;
+          continue;
         }
         let sourceWindows = packetWindows(matches.map((anchor) => anchor.packet), sourceStream, source.path, finite(sourceMetadata[sourceIndex]!.format.start_time) || 0);
         const outputWindows = packetWindows(matches.map((anchor) => anchor.matches[0]!), target, params.path, finite(output.format.start_time) || 0);
@@ -823,6 +905,52 @@ async function verify(params: VerifyExportParams, job: Job): Promise<ExportVerif
           if (outputFrames[index]!.pts < outputFrames[index - 1]!.pts) fail('Output presentation timestamps run backwards at a boundary');
         }
       }
+      for (const sourceStream of sourceMetadata[sourceIndex]!.streams.filter((stream) => stream.codec_type === 'audio')) {
+        const targetIndex = sourceMappings[sourceIndex]!.get(sourceStream.index);
+        if (targetIndex == null || !reencodedAudio.has(targetIndex)) continue;
+        const target = output.streams[targetIndex]!;
+        const lossless = (codec: string | undefined) => codec === 'flac' || /^pcm_[su]\d+(?:le|be)?$/.test(codec ?? '') || ['pcm_bluray', 'pcm_dvd'].includes(codec ?? '');
+        if (!lossless(sourceStream.codec_name) || !lossless(target.codec_name)) { doubt('Only explicitly declared lossless PCM/FLAC audio conversions have a sample oracle'); continue; }
+        if (sourceStream.sample_rate !== target.sample_rate || sourceStream.channels !== target.channels) { doubt('Declared audio resampling or channel conversion needs a separate content oracle'); continue; }
+        const origin = finite(sourceMetadata[sourceIndex]!.format.start_time) || 0;
+        const trackStart = finite(sourceStream.start_time);
+        const trackEnd = trackStart + finite(sourceStream.duration);
+        const from = Math.max(origin + (source.start ?? 0), Number.isFinite(trackStart) ? trackStart : origin);
+        const to = Math.min(source.end == null ? finalMediaTime(sourceMetadata[sourceIndex]!) : origin + source.end, Number.isFinite(trackEnd) ? trackEnd : Infinity);
+        const context = boundaryContext(sourceMetadata[sourceIndex]!);
+        const intervals = [{ from, to: Math.min(to, from + context) }, { from: Math.max(from, to - context), to }];
+        if (intervals[1]!.from <= intervals[0]!.to) intervals.splice(0, 2, { from, to });
+        const rate = Number(sourceStream.sample_rate);
+        const quantum = ratio(sourceStream.time_base) / timeScale + ratio(target.time_base) + 1 / rate;
+        let commonShift = groups.length > 0 ? compareBoundaryShifts(groups).commonShift : NaN;
+        if (!Number.isFinite(commonShift)) commonShift = (Number.isFinite(finite(target.start_time)) ? finite(target.start_time) : finite(output.format.start_time)) - Math.ceil(from * rate) / (rate * timeScale);
+        const convertedShifts: number[] = [];
+        const edges = outputEdges.get(target.index);
+        if (edges != null) {
+          const tick = ratio(target.time_base);
+          if (!params.merged || sourceIndex === 0) convertedShifts.push(edges.first.pts * tick + edges.first.skip / rate - Math.ceil(from * rate) / (rate * timeScale));
+          if (!params.merged || sourceIndex === params.sources.length - 1) convertedShifts.push((edges.last.pts + edges.last.duration) * tick - edges.last.discard / rate - Math.ceil(to * rate) / (rate * timeScale));
+        } else doubt('Cannot identify the actual converted audio endpoints');
+        for (const interval of intervals) {
+          try {
+            const reference = await decode({ path: source.path, stream: sourceStream, from: Math.max(origin, interval.from - context), to: interval.to + context, origin, wholeAudioFrames: true, samples32: true }, signal);
+            const start = interval.from / timeScale + commonShift;
+            const end = interval.to / timeScale + commonShift;
+            const frames = await decode({ path: params.path, stream: target, from: start, to: end, origin: finite(output.format.start_time) || 0, wholeAudioFrames: true, samples32: true }, signal);
+            const actual: Frame[] = [];
+            for (const frame of frames) {
+              const first = Math.max(0, Math.ceil((start - frame.pts) * rate));
+              const last = Math.min(frame.samples!.length / (target.channels ?? 1), Math.ceil((end - frame.pts) * rate));
+              if (last > first) actual.push({ ...frame, pts: frame.pts + first / rate, duration: (last - first) / rate, samples: frame.samples!.subarray(first * (target.channels ?? 1), last * (target.channels ?? 1)) });
+            }
+            const comparison = await compareConvertedAudio(reference, actual, commonShift, timeScale, sourceStream, target, signal);
+            if (!comparison.complete) doubt('Converted audio sample content cannot be placed uniquely on the source clock');
+            else if (!comparison.equal) fail('Declared lossless audio conversion changed decoded samples');
+            else convertedShifts.push(...comparison.shifts);
+          } catch (error) { doubt(`Declared audio conversion could not be verified: ${String(error)}`); }
+        }
+        groups.push({ type: 'audio', shifts: convertedShifts, quantum });
+      }
       if (params.reencodedVideo && !params.merged) {
         const origin = finite(sourceMetadata[sourceIndex]!.format.start_time) || 0;
         const from = origin + (source.start ?? 0);
@@ -833,7 +961,7 @@ async function verify(params: VerifyExportParams, job: Job): Promise<ExportVerif
         if (windows[1]!.from <= windows[0]!.to) windows.splice(0, 2, { from, to });
         const streams = sourceMetadata[sourceIndex]!.streams.filter((stream) => source.streamIds == null || source.streamIds.includes(stream.index));
         for (const sourceStream of streams.filter((stream) => stream.codec_type === 'video')) {
-          const target = output.streams[streams.indexOf(sourceStream)];
+          const target = output.streams[sourceMappings[sourceIndex]!.get(sourceStream.index)!];
           if (target == null) continue;
           for (const interval of windows) {
             try {
@@ -879,7 +1007,7 @@ async function verify(params: VerifyExportParams, job: Job): Promise<ExportVerif
         }
       }
     }
-    coverage.boundaries = !inconclusive;
+    coverage.boundaries = !inconclusive && !deferredAudioContent;
     const finalIdentity = await stat(params.path, { bigint: true });
     if (initialIdentity.ino !== finalIdentity.ino || initialIdentity.size !== finalIdentity.size || initialIdentity.mtimeNs !== finalIdentity.mtimeNs) doubt('Output changed while it was being verified');
     for (const [path, identity] of sourceIdentities) {
@@ -889,7 +1017,12 @@ async function verify(params: VerifyExportParams, job: Job): Promise<ExportVerif
   } catch (error) {
     doubt(signal.aborted ? 'Verification cancelled; output and intermediate files were preserved' : `Verification could not finish: ${error instanceof Error ? error.message : String(error)}`);
   }
-  return { status: failed ? 'failed' : (inconclusive ? 'inconclusive' : 'passed'), ...(signal.aborted ? { cancelled: true } : {}), issues, elapsedMs: performance.now() - job.started, coverage };
+  if (deferredAudioContent) issues.push('Copied AAC intermediate awaits the final merge and its original-source PCM content proof; it is not validated for publication');
+  let status: ExportVerificationResult['status'] = 'passed';
+  if (failed) status = 'failed';
+  else if (inconclusive) status = 'inconclusive';
+  else if (deferredAudioContent) status = 'pending-merge';
+  return { status, ...(signal.aborted ? { cancelled: true } : {}), issues, elapsedMs: performance.now() - job.started, coverage };
 }
 
 export function verifyExport(params: VerifyExportParams): Promise<ExportVerificationResult> {
