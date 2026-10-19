@@ -26,10 +26,13 @@ export function getProvenanceMetadataArgs(tags: object | undefined) {
   const marker = values['stash_compression'];
   let comment = values['comment'] ?? '';
   if (!marker && !comment.includes('STASH-COMPRESSION:v1:')) return [];
-  if (marker && !comment.includes('STASH-COMPRESSION:v1:')) {
+  if (marker) {
     try {
       const parsed = JSON.parse(marker) as { id?: unknown, profile?: unknown };
-      if (typeof parsed.id === 'string' && typeof parsed.profile === 'string') comment += `${comment ? '\n' : ''}STASH-COMPRESSION:v1:${parsed.id}:${parsed.profile}`;
+      if (typeof parsed.id === 'string' && typeof parsed.profile === 'string') {
+        const fallback = `STASH-COMPRESSION:v1:${parsed.id}:${parsed.profile}`;
+        if (!(comment.match(/STASH-COMPRESSION:v1:[^\s]+/g) ?? []).includes(fallback)) comment += `${comment ? '\n' : ''}${fallback}`;
+      }
     } catch { /* Preserve an unrecognized marker for provenance review. */ }
   }
   return [...(marker ? ['-metadata', `stash_compression=${marker}`] : []), ...(comment ? ['-metadata', `comment=${comment}`] : [])];
@@ -37,7 +40,13 @@ export function getProvenanceMetadataArgs(tags: object | undefined) {
 
 export function getMergedProvenanceMetadataArgs(groups: (object | undefined)[]) {
   const records = groups.map((tags) => getProvenanceMetadataArgs(tags));
+  if (records.every((args) => args.length === 0)) return [];
   const primary = records.find((args) => args.some((value) => value.startsWith('stash_compression=')))?.find((value) => value.startsWith('stash_compression='));
-  const comments = records.flatMap((args) => args.filter((value) => value.startsWith('comment=')).map((value) => value.slice('comment='.length)));
+  const comments = records.flatMap((args, index) => {
+    const retained = args.filter((value) => value.startsWith('comment=')).map((value) => value.slice('comment='.length));
+    if (retained.length > 0) return retained;
+    const ordinary = Object.entries(groups[index] ?? {}).findLast(([key, value]) => key.toLowerCase() === 'comment' && typeof value === 'string')?.[1];
+    return typeof ordinary === 'string' && ordinary.length > 0 ? [ordinary] : [];
+  });
   return [...(primary ? ['-metadata', primary] : []), ...(comments.length > 0 ? ['-metadata', `comment=${[...new Set(comments)].join('\n')}`] : [])];
 }

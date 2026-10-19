@@ -41,3 +41,29 @@ test('merging marked inputs retains every source identity in the comment fallbac
   expect(args.filter((value) => value.startsWith('stash_compression='))).toHaveLength(1);
   expect(args.at(-1)).toBe(`comment=STASH-COMPRESSION:v1:${ids[0]}:${profile}\nSTASH-COMPRESSION:v1:${ids[1]}:${profile}`);
 });
+
+test('marked secondary inputs preserve the unmarked main comment and every selected provenance identity', () => {
+  const profile = 'hevc-main10-crf26-slow-v1';
+  const marker = JSON.stringify({ id: '12345678-1234-1234-1234-123456789abc', profile, version: 1, generation: 1 });
+  const secondaryFallback = `STASH-COMPRESSION:v1:87654321-4321-4321-4321-cba987654321:${profile}`;
+  expect(getMergedProvenanceMetadataArgs([
+    { COMMENT: 'Original main comment' },
+    { STASH_COMPRESSION: marker, comment: 'Secondary comment' },
+    { comment: secondaryFallback },
+  ])).toEqual(['-metadata', `stash_compression=${marker}`, '-metadata', `comment=Original main comment\nSecondary comment\nSTASH-COMPRESSION:v1:12345678-1234-1234-1234-123456789abc:${profile}\n${secondaryFallback}`]);
+});
+
+test('ordinary comments do not force global metadata when no selected source has provenance', () => {
+  expect(getMergedProvenanceMetadataArgs([{ comment: 'Main comment' }, undefined, { COMMENT: 'Secondary comment' }])).toEqual([]);
+});
+
+test('a secondary tag retains its own fallback when its comment already identifies another source', () => {
+  const profile = 'hevc-main10-crf26-slow-v1';
+  const ids = ['00000000-0000-4000-8000-000000000001', '00000000-0000-4000-8000-000000000002', '00000000-0000-4000-8000-000000000003'];
+  const marker = (id: string) => JSON.stringify({ version: 1, id, profile, generation: 1 });
+  const fallback = (id: string) => `STASH-COMPRESSION:v1:${id}:${profile}`;
+  expect(getMergedProvenanceMetadataArgs([
+    { stash_compression: marker(ids[0]!), comment: fallback(ids[0]!) },
+    { stash_compression: marker(ids[1]!), comment: fallback(ids[2]!) },
+  ])).toEqual(['-metadata', `stash_compression=${marker(ids[0]!)}`, '-metadata', `comment=${fallback(ids[0]!)}\n${fallback(ids[2]!)}\n${fallback(ids[1]!)}`]);
+});

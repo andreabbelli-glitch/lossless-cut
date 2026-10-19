@@ -409,7 +409,7 @@ function useFfmpegOperations({ filePath, treatInputFileModifiedTimeAsStart, trea
     }
 
     invariant(filePath != null);
-    const provenance = getProvenanceMetadataArgs(allFilesMeta[filePath]?.format?.tags);
+    const provenance = getMergedProvenanceMetadataArgs(copyFileStreamsFiltered.map((source) => allFilesMeta[source.path]?.format?.tags));
 
     const customFileMetadataArgs = Object.entries(paramsByFile.get(filePath)?.metadata ?? {}).flatMap(([key, value]) => [
       '-metadata', `${key}=${value}`,
